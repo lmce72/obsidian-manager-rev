@@ -85,6 +85,10 @@ export default class Manager extends Plugin {
     private draggedRibbonItem: HTMLElement | null = null;
     private dragObserverCleanup: (() => void) | null = null;
 
+    // Ribbon DOM 监听器，用于应对其他插件干预
+    private ribbonDomObserver: MutationObserver | null = null;
+    private ribbonStyleReapplyDebouncer: number | null = null;
+
     public async onload() {
         this.appPlugins = (this.app as ObsidianAppWithInternals).plugins;
         this.appWorkspace = this.app.workspace;
@@ -133,9 +137,8 @@ export default class Manager extends Plugin {
 
         this.repoResolver = new RepoResolver(this);
 
-        if (this.isRibbonManagerEnabled()) {
-            await this.syncStoredRibbonConfig();
-        } else {
+        // 早期清理（如果 Ribbon Manager 被禁用）
+        if (!this.isRibbonManagerEnabled()) {
             this.clearRibbonStyleOverrides();
         }
 
@@ -165,12 +168,28 @@ export default class Manager extends Plugin {
         });
 
         this.app.workspace.onLayoutReady(() => {
+            // 修复：延迟到 layoutReady 后同步 Ribbon 配置，确保所有插件（包括延迟启动的）都已加载
+            if (this.isRibbonManagerEnabled()) {
+                void this.syncStoredRibbonConfig();
+            }
             this.startRibbonRuntimeFeatures();
             // 延迟启动自检，确保 Obsidian 初始化完成，避免自动接管被覆盖
             window.setTimeout(() => {
-                if (this.isRibbonManagerEnabled()) this.cleanRibbonItems(); // 启动后清理一次
+                if (this.isRibbonManagerEnabled()) {
+                    this.cleanRibbonItems(); // 启动后清理一次
+                    // 再次应用样式，确保延迟加载的插件也被正确处理
+                    this.updateRibbonStyles();
+                }
                 if (this.settings.DELAY) void performSelfCheck(this);
             }, 2000);
+
+            // 额外的延迟检查，应对更晚加载的插件
+            if (this.isRibbonManagerEnabled()) {
+                window.setTimeout(() => {
+                    this.cleanRibbonItems();
+                    this.updateRibbonStyles();
+                }, 5000);
+            }
         });
     }
 
@@ -211,6 +230,69 @@ export default class Manager extends Plugin {
             activeDocument.removeEventListener('pointerdown', handlePointerDown, true);
             activeDocument.removeEventListener('pointerup', handlePointerUp, true);
         };
+    }
+
+    /**
+     * 设置 Ribbon DOM 监听器，应对其他插件干预导致的样式覆盖
+     * 监听 Ribbon 容器的 DOM 变化，自动重新应用设置
+     */
+    private setupRibbonDomObserver() {
+        if (!this.isRibbonManagerEnabled() || this.ribbonDomObserver) return;
+
+        const ribbonContainer = activeDocument.querySelector('.side-dock-actions');
+        if (!ribbonContainer) {
+            // 容器尚未加载，稍后重试
+            window.setTimeout(() => this.setupRibbonDomObserver(), 500);
+            return;
+        }
+
+        this.ribbonDomObserver = new MutationObserver((mutations) => {
+            if (!this.isRibbonManagerEnabled()) return;
+
+            let shouldReapply = false;
+
+            for (const mutation of mutations) {
+                // 检测新增或删除的 Ribbon 图标
+                if (mutation.type === 'childList' && (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)) {
+                    shouldReapply = true;
+                    break;
+                }
+
+                // 检测样式属性被修改（其他插件可能覆盖了 display 或 order）
+                if (mutation.type === 'attributes') {
+                    const target = mutation.target as HTMLElement;
+                    if (target.classList?.contains('side-dock-ribbon-action')) {
+                        const attrName = mutation.attributeName;
+                        if (attrName === 'style' || attrName === 'class') {
+                            // 检查是否是我们管理的元素
+                            if (target.hasAttribute('data-bpm-ribbon-managed')) {
+                                shouldReapply = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (shouldReapply) {
+                // 使用防抖避免频繁重绘
+                if (this.ribbonStyleReapplyDebouncer !== null) {
+                    window.clearTimeout(this.ribbonStyleReapplyDebouncer);
+                }
+                this.ribbonStyleReapplyDebouncer = window.setTimeout(() => {
+                    this.updateRibbonStyles();
+                    this.ribbonStyleReapplyDebouncer = null;
+                }, 300);
+            }
+        });
+
+        // 监听子节点变化和属性变化
+        this.ribbonDomObserver.observe(ribbonContainer, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['style', 'class']
+        });
     }
 
     private async handleRibbonPointerUp(e: PointerEvent) {
@@ -264,21 +346,20 @@ export default class Manager extends Plugin {
         const items = this.settings.RIBBON_SETTINGS;
         const targetItem = items.find(i => i.name === label); // name 通常就是 label
 
-        let targetId = targetItem?.id;
+        let targetId = targetItem?.bpmUniqueId;
 
         // 如果 settings 里还没同步名字，尝试反查 app.workspace.leftRibbon
         if (!targetId) {
             const ribbonItems = (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items || [];
             const nativeItem = ribbonItems.find((i): i is RibbonNativeItem => Boolean(i && (i.title === label || i.name === label)));
-            if (nativeItem) targetId = nativeItem.id;
+            if (nativeItem?.buttonEl) targetId = (nativeItem.buttonEl as any).dataset.bpmUniqueId;
         }
 
         if (targetId) {
             console.log(`[BPM] Drag-to-hide triggered for: ${label} (${targetId})`);
 
             // 执行隐藏逻辑
-            // 执行隐藏逻辑
-            const targetConfig = this.settings.RIBBON_SETTINGS.find(i => i.id === targetId);
+            const targetConfig = this.settings.RIBBON_SETTINGS.find(i => i.bpmUniqueId === targetId);
             if (targetConfig) {
                 targetConfig.visible = false;
             } else {
@@ -289,9 +370,9 @@ export default class Manager extends Plugin {
             // 保存设置 (这将更新 RIBBON_SETTINGS 到 data.json)
             await this.saveSettings();
 
-            const orderedIds = this.settings.RIBBON_SETTINGS.map(i => i.id);
+            const orderedIds = this.settings.RIBBON_SETTINGS.map(i => i.bpmUniqueId);
             const hiddenStatus: Record<string, boolean> = {};
-            this.settings.RIBBON_SETTINGS.forEach(i => hiddenStatus[i.id] = !i.visible);
+            this.settings.RIBBON_SETTINGS.forEach(i => hiddenStatus[i.bpmUniqueId] = !i.visible);
 
             this.applyRibbonConfigToMemory(orderedIds, hiddenStatus);
             // 更新 CSS 样式 (重要：这控制了实际的显隐)
@@ -370,17 +451,88 @@ export default class Manager extends Plugin {
             this.menuObserver.disconnect();
             this.menuObserver = null;
         }
+
+        // 停止 Ribbon DOM 监听器
+        if (this.ribbonDomObserver) {
+            this.ribbonDomObserver.disconnect();
+            this.ribbonDomObserver = null;
+        }
+
+        if (this.ribbonStyleReapplyDebouncer !== null) {
+            window.clearTimeout(this.ribbonStyleReapplyDebouncer);
+            this.ribbonStyleReapplyDebouncer = null;
+        }
     }
 
     private async syncStoredRibbonConfig() {
         if (!this.isRibbonManagerEnabled()) return;
         this.ensureSystemRibbonManager();
-        const savedRibbonItems = [...(this.settings.RIBBON_SETTINGS || [])]
-            .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-        const orderedRibbonIds = savedRibbonItems.map((item) => item.id);
-        const hiddenRibbonStatus: Record<string, boolean> = {};
-        savedRibbonItems.forEach((item) => hiddenRibbonStatus[item.id] = !item.visible);
-        await this.syncRibbonConfig(orderedRibbonIds, hiddenRibbonStatus);
+
+        // 只为内存项分配 bpmUniqueId 并应用样式，不修改 RIBBON_SETTINGS
+        const memoryItems = (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items || [];
+        const currentSettings = this.settings.RIBBON_SETTINGS || [];
+
+        // 建立已保存配置的映射
+        const savedSettingsMap = new Map<string, RibbonItem>();
+        currentSettings.forEach((item) => {
+            if (item.bpmUniqueId) {
+                savedSettingsMap.set(item.bpmUniqueId, item);
+            }
+            if (item.name) {
+                savedSettingsMap.set(`name:${item.name}`, item);
+            }
+            if (item.ribbonIdMap) {
+                Object.values(item.ribbonIdMap).forEach(id => {
+                    if (id) savedSettingsMap.set(`ribbonId:${id}`, item);
+                });
+            }
+        });
+
+        // 为内存项分配 bpmUniqueId，优先使用已保存的配置
+        const prefixCounters = new Map<string, number>();
+        memoryItems.forEach((item) => {
+            const buttonEl = item?.buttonEl;
+            if (!buttonEl) return;
+
+            // 如果已经有 bpmUniqueId，跳过
+            if ((buttonEl as any).dataset?.bpmUniqueId) return;
+
+            // 尝试从已保存配置中恢复 bpmUniqueId
+            let restoredId: string | null = null;
+
+            // 方法1: 通过 name 匹配
+            if (item.title) {
+                const savedItem = savedSettingsMap.get(`name:${item.title}`);
+                if (savedItem) {
+                    restoredId = savedItem.bpmUniqueId;
+                }
+            }
+
+            // 方法2: 通过 ribbonId 匹配
+            if (!restoredId && item.id) {
+                const savedItem = savedSettingsMap.get(`ribbonId:${item.id}`);
+                if (savedItem) {
+                    restoredId = savedItem.bpmUniqueId;
+                }
+            }
+
+            // 方法3: 如果无法恢复，分配新的 bpmUniqueId
+            if (!restoredId) {
+                const prefix = (item?.id || "").split(":")[0];
+                const count = (prefixCounters.get(prefix) || 0) + 1;
+                prefixCounters.set(prefix, count);
+                restoredId = count === 1 ? prefix : `${prefix}#${count}`;
+            }
+
+            // 分配 bpmUniqueId
+            if (!(buttonEl as any).dataset) {
+                (buttonEl as any).dataset = {};
+            }
+            (buttonEl as any).dataset.bpmUniqueId = restoredId;
+        });
+
+        // 只应用样式，不修改 RIBBON_SETTINGS
+        this.updateRibbonStyles();
     }
 
     private startRibbonRuntimeFeatures() {
@@ -395,8 +547,10 @@ export default class Manager extends Plugin {
         if (Platform.isMobile) {
             this.setupMenuObserver();
         } else {
-            // 仅桌面端启用“拖出即隐藏”功能
+            // 仅桌面端启用”拖出即隐藏”功能
             this.setupDragToHideObserver();
+            // 桌面端启用 Ribbon DOM 监听器，应对其他插件干预
+            this.setupRibbonDomObserver();
         }
     }
 
@@ -835,20 +989,42 @@ export default class Manager extends Plugin {
     /**
      * 清理 Obsidian Ribbon 内部 items 数组中的 undefined/null 项
      * 防止原生方法遍历时 crash
+     * 同时清理重复的 ID，修复切换语言时核心插件图标重复的问题
      */
     public cleanRibbonItems() {
         const ribbon = (this.app.workspace as WorkspaceWithRibbon).leftRibbon;
         if (!ribbon || !ribbon.items || !Array.isArray(ribbon.items)) return;
 
         let cleaned = false;
+        const seenIds = new Set<string>();
+
         // 倒序遍历删除
         for (let i = ribbon.items.length - 1; i >= 0; i--) {
-            if (!ribbon.items[i]) {
+            const item = ribbon.items[i];
+
+            // 删除 null/undefined 项
+            if (!item) {
                 ribbon.items.splice(i, 1);
                 cleaned = true;
+                continue;
+            }
+
+            // 删除重复 ID 项（保留第一次出现的）
+            if (item.id && seenIds.has(item.id)) {
+                if (this.settings.DEBUG) {
+                    console.warn(`[BPM] Duplicate ribbon item removed from memory: ${item.id}`);
+                }
+                ribbon.items.splice(i, 1);
+                cleaned = true;
+                continue;
+            }
+
+            if (item.id) {
+                seenIds.add(item.id);
             }
         }
-        if (cleaned) console.log("[BPM] Cleaned undefined items from leftRibbon.");
+
+        if (cleaned) console.log("[BPM] Cleaned undefined/duplicate items from leftRibbon.");
     }
 
     // 关闭延时 调用
@@ -1438,6 +1614,34 @@ export default class Manager extends Plugin {
     private findRibbonSettingForElement(element: HTMLElement, items: RibbonItem[]): RibbonItem | undefined {
         const label = element.getAttribute("aria-label") || element.getAttribute("title") || "";
         if (!label) return undefined;
+
+        // 方法 1: 通过 bpmUniqueId 精确匹配（推荐）
+        const closestAction = element.closest('.side-dock-ribbon-action');
+        const ribbonItem = closestAction ? (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items?.find(item =>
+            item?.buttonEl === closestAction
+        ) : null;
+        if (ribbonItem?.buttonEl && (ribbonItem.buttonEl as any).dataset?.bpmUniqueId) {
+            const found = items.find(item => item.bpmUniqueId === (ribbonItem.buttonEl as any).dataset.bpmUniqueId);
+            if (found) return found;
+        }
+
+        // 方法 2: 通过 ribbonIdMap 匹配（备用）
+        for (const item of items) {
+            if (item.ribbonIdMap) {
+                const idValues = Object.values(item.ribbonIdMap);
+                // 检查当前元素的某个父级是否匹配 ribbonIdMap 中的任何 ID
+                let currentEl: HTMLElement | null = element;
+                while (currentEl) {
+                    const elId = currentEl.id || '';
+                    if (idValues.some(id => id && elId.includes(id))) {
+                        return item;
+                    }
+                    currentEl = currentEl.parentElement;
+                }
+            }
+        }
+
+        // 方法 3: 通过 label 匹配（最后备用）
         return items.find((item) => item.name && this.ribbonLabelMatchesName(label, item.name));
     }
 
@@ -1533,10 +1737,13 @@ export default class Manager extends Plugin {
             let visible = true;
 
             if (name) {
-                const setting = ribbonSettings.find(s => s.name === name);
+                // 优先通过 bpmUniqueId 匹配，fallback 到 name 匹配
+                const setting = ribbonSettings.find(s =>
+                    s.name === name || s.bpmUniqueId === name
+                );
                 if (setting) {
                     order = setting.order;
-                    visible = setting.visible;
+                    visible = setting.visible !== false;
                 }
             }
             return { item, order, visible };
@@ -1586,70 +1793,145 @@ export default class Manager extends Plugin {
             return;
         }
 
-        // 更新本地设置以匹配原生配置
-        const currentItems = this.settings.RIBBON_SETTINGS || [];
-        const itemMap = new Map(currentItems.map(i => [i.id, i]));
+        const currentLang = (this.app.vault as any).getConfig?.("language") || "en";
+        const isZh = currentLang.startsWith("zh");
 
-        const newItems: RibbonItem[] = [];
+        const memoryItems = (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items || [];
+        const currentSettings = this.settings.RIBBON_SETTINGS || [];
 
-        orderedIds.forEach((id, index) => {
-            let item = itemMap.get(id);
-            if (!item) {
-                // 尝试从 workspace 查找名称，或者使用 ID
-                const nativeItem = (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items?.find((i): i is RibbonNativeItem => Boolean(i && i.id === id));
-                const name = nativeItem?.title || nativeItem?.ariaLabel || id;
-                const icon = nativeItem?.icon || "help-circle";
-                item = {
-                    id,
-                    name,
-                    icon,
-                    visible: !hiddenStatus[id],
-                    order: index
-                };
-            } else {
-                item.order = index;
-                item.visible = !hiddenStatus[id];
+        // 建立已保存配置的映射（用于恢复 bpmUniqueId）
+        const savedSettingsMap = new Map<string, RibbonItem>();
+        currentSettings.forEach((item) => {
+            if (item.bpmUniqueId) {
+                savedSettingsMap.set(item.bpmUniqueId, item);
             }
-            newItems.push(item);
+            // 也建立 name 到配置的映射，用于匹配
+            if (item.name) {
+                savedSettingsMap.set(`name:${item.name}`, item);
+            }
+            // 建立 ribbonIdMap 的映射
+            if (item.ribbonIdMap) {
+                Object.values(item.ribbonIdMap).forEach(id => {
+                    if (id) savedSettingsMap.set(`ribbonId:${id}`, item);
+                });
+            }
         });
 
+        // 为内存项分配 bpmUniqueId，优先使用已保存的配置
+        const prefixCounters = new Map<string, number>();
+        memoryItems.forEach((item) => {
+            const buttonEl = item?.buttonEl;
+            if (!buttonEl) return;
 
+            // 如果已经有 bpmUniqueId，跳过
+            if ((buttonEl as any).dataset?.bpmUniqueId) return;
 
-        // 那些在 orderedIds 里没有的项？可能是被完全删除了，或者尚未加载。
-        // 保留它们，放在最后？
-        // 暂时只同步文件里存在的。
-        // NEW: 检查 app.workspace.leftRibbon.items 是否有遗漏的（即原生文件里还没记录的新插件）
-        const memoryItems = (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items || [];
-        const seenIds = new Set(orderedIds);
+            // 尝试从已保存配置中恢复 bpmUniqueId
+            let restoredId: string | null = null;
 
-        memoryItems.forEach((mItem) => {
-            if (!mItem) return;
-            const itemId = mItem.id;
-            if (!itemId) return;
-            if (!seenIds.has(itemId)) {
-                // 这是一个新出现的项，追加到末尾
-                const item: RibbonItem = {
-                    id: itemId,
-                    name: mItem.title || mItem.ariaLabel || itemId,
-                    icon: mItem.icon || "help-circle",
-                    visible: true,
-                    order: newItems.length
-                };
-                newItems.push(item);
+            // 方法1: 通过 name 匹配
+            if (item.title) {
+                const savedItem = savedSettingsMap.get(`name:${item.title}`);
+                if (savedItem) {
+                    restoredId = savedItem.bpmUniqueId;
+                }
             }
+
+            // 方法2: 通过 ribbonId 匹配
+            if (!restoredId && item.id) {
+                const savedItem = savedSettingsMap.get(`ribbonId:${item.id}`);
+                if (savedItem) {
+                    restoredId = savedItem.bpmUniqueId;
+                }
+            }
+
+            // 方法3: 如果无法恢复，分配新的 bpmUniqueId
+            if (!restoredId) {
+                const prefix = (item?.id || "").split(":")[0];
+                const count = (prefixCounters.get(prefix) || 0) + 1;
+                prefixCounters.set(prefix, count);
+                restoredId = count === 1 ? prefix : `${prefix}#${count}`;
+            }
+
+            // 分配 bpmUniqueId
+            if (!(buttonEl as any).dataset) {
+                (buttonEl as any).dataset = {};
+            }
+            (buttonEl as any).dataset.bpmUniqueId = restoredId;
+        });
+
+        // 建立当前内存中存在的项的集合
+        const memoryUniqueIds = new Set<string>();
+        memoryItems.forEach((memItem) => {
+            const uniqueId = (memItem?.buttonEl as any)?.dataset?.bpmUniqueId;
+            if (uniqueId) memoryUniqueIds.add(uniqueId);
+        });
+
+        const newItems: RibbonItem[] = [];
+        const processedUniqueIds = new Set<string>();
+
+        // 优先保留旧配置中仍然存在的项（保留用户的 visible 和 order 设置）
+        currentSettings.forEach((savedItem) => {
+            if (memoryUniqueIds.has(savedItem.bpmUniqueId)) {
+                // 该项仍然存在，完全保留用户配置
+                const memItem = memoryItems.find(m =>
+                    (m?.buttonEl as any)?.dataset?.bpmUniqueId === savedItem.bpmUniqueId
+                );
+
+                if (memItem) {
+                    const ribbonIdMap = savedItem.ribbonIdMap || {};
+                    if (isZh) {
+                        ribbonIdMap.zh = memItem.id;
+                    } else {
+                        ribbonIdMap.en = memItem.id;
+                    }
+
+                    newItems.push({
+                        bpmUniqueId: savedItem.bpmUniqueId,
+                        name: memItem.title || savedItem.name,
+                        icon: memItem.icon || savedItem.icon || "help-circle",
+                        visible: savedItem.visible,  // 保留用户设置
+                        order: savedItem.order,      // 保留用户设置
+                        ribbonIdMap
+                    });
+                    processedUniqueIds.add(savedItem.bpmUniqueId);
+                }
+            }
+        });
+
+        // 添加新出现的项（之前配置中不存在的）
+        memoryItems.forEach((memItem) => {
+            if (!memItem?.title || !memItem?.id) return;
+            const uniqueId = (memItem.buttonEl as any)?.dataset.bpmUniqueId;
+            if (!uniqueId) return;
+            if (processedUniqueIds.has(uniqueId)) return;
+            processedUniqueIds.add(uniqueId);
+
+            const ribbonIdMap: Record<string, string> = {};
+            if (isZh) {
+                ribbonIdMap.zh = memItem.id;
+            } else {
+                ribbonIdMap.en = memItem.id;
+            }
+
+            newItems.push({
+                bpmUniqueId: uniqueId,
+                name: memItem.title,
+                icon: memItem.icon || "help-circle",
+                visible: true,  // 新项默认显示
+                order: newItems.length,
+                ribbonIdMap
+            });
+        });
+
+        // 按 order 排序并重新分配连续的 order
+        newItems.sort((a, b) => a.order - b.order);
+        newItems.forEach((item, index) => {
+            item.order = index;
         });
 
         this.settings.RIBBON_SETTINGS = newItems;
-        // 不需要 saveSettings，因为这只是内存状态同步？
-        // 最好 save 一下，以免下次启动加载旧的 data.json
         await this.saveSettings();
-
-        // 如果 RibbonModal 打开着，可能需要通知它刷新？
-        // 目前 RibbonModal 没有注册全局事件。
-        // 可以在 RibbonModal 内部实现轮询或事件监听。
-        // 或者在这里不做任何 UI 刷新，仅仅更新数据。
-
-        // 必须更新样式，否则显隐状态不会立即生效
         this.updateRibbonStyles();
     }
 }

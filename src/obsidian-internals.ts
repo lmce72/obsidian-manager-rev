@@ -68,6 +68,7 @@ export type RibbonNativeItem = {
     name?: string;
     ariaLabel?: string;
     icon?: string;
+    buttonEl?: HTMLElement;
 };
 
 export type LeftRibbonLike = {

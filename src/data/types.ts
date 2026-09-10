@@ -34,11 +34,15 @@ export interface Delay {
 }
 
 export interface RibbonItem {
-	id: string;
+	bpmUniqueId: string; // 唯一标识符
 	name: string;
 	icon: string;
 	visible: boolean;
 	order: number;
+	ribbonIdMap?: {
+		en?: string;
+		zh?: string;
+	};
 }
 
 export interface PluginLayoutItem {

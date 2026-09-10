@@ -1,4 +1,4 @@
-import { App, Modal, Setting, setIcon, ButtonComponent } from "obsidian";
+import { App, Modal, Setting, setIcon, ButtonComponent, TextComponent } from "obsidian";
 import Manager from "main";
 import { RibbonItem } from "../data/types";
 import { confirmWithModal } from "../utils";
@@ -8,8 +8,13 @@ export class RibbonModal extends Modal {
     private renderRootEl?: HTMLElement;
     private renderToolbarInRoot = true;
 
+    // 过滤和搜索
+    private currentFilter: "all" | "visible" | "hidden" = "all";
+    private searchQuery = "";
+
     // 拖拽相关变量
     draggedItemEl: HTMLElement | null = null;
+    draggedItem: RibbonItem | null = null;
     ghostEl: HTMLElement | null = null;
     placeholderEl: HTMLElement | null = null;
     dragStartIndex = -1;
@@ -36,21 +41,79 @@ export class RibbonModal extends Modal {
         this.display();
     }
 
-    // 同步 Ribbon 项：读取当前工作区的 Ribbon，合并到设置中
+    // 同步 Ribbon 项：只确保 bpmUniqueId 已分配，不修改已保存的配置
     async syncRibbonItems() {
         if (!this.manager.isRibbonManagerEnabled()) return;
 
-        // 以 BPM 自己的 data.json 为源头，只从运行时内存补齐新出现的 Ribbon 项。
-        const savedItems = [...(this.manager.settings.RIBBON_SETTINGS || [])]
-            .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-        const orderedIds = savedItems.map((item) => item.id);
-        const hiddenStatus: Record<string, boolean> = {};
-        savedItems.forEach((item) => hiddenStatus[item.id] = !item.visible);
-        await this.manager.syncRibbonConfig(orderedIds, hiddenStatus);
+        // 只为 Ribbon 项分配 bpmUniqueId（如果还没有的话）
+        const memoryItems = (this.app.workspace as any).leftRibbon?.items || [];
+        const currentSettings = this.manager.settings.RIBBON_SETTINGS || [];
+
+        // 建立已保存配置的映射（用于恢复 bpmUniqueId）
+        const savedSettingsMap = new Map<string, RibbonItem>();
+        currentSettings.forEach((item) => {
+            if (item.bpmUniqueId) {
+                savedSettingsMap.set(item.bpmUniqueId, item);
+            }
+            if (item.name) {
+                savedSettingsMap.set(`name:${item.name}`, item);
+            }
+            if (item.ribbonIdMap) {
+                Object.values(item.ribbonIdMap).forEach(id => {
+                    if (id) savedSettingsMap.set(`ribbonId:${id}`, item);
+                });
+            }
+        });
+
+        // 为内存项分配 bpmUniqueId，优先使用已保存的配置
+        const prefixCounters = new Map<string, number>();
+        memoryItems.forEach((item: any) => {
+            const buttonEl = item?.buttonEl;
+            if (!buttonEl) return;
+
+            // 如果已经有 bpmUniqueId，跳过
+            if ((buttonEl as any).dataset?.bpmUniqueId) return;
+
+            // 尝试从已保存配置中恢复 bpmUniqueId
+            let restoredId: string | null = null;
+
+            // 方法1: 通过 name 匹配
+            if (item.title) {
+                const savedItem = savedSettingsMap.get(`name:${item.title}`);
+                if (savedItem) {
+                    restoredId = savedItem.bpmUniqueId;
+                }
+            }
+
+            // 方法2: 通过 ribbonId 匹配
+            if (!restoredId && item.id) {
+                const savedItem = savedSettingsMap.get(`ribbonId:${item.id}`);
+                if (savedItem) {
+                    restoredId = savedItem.bpmUniqueId;
+                }
+            }
+
+            // 方法3: 如果无法恢复，分配新的 bpmUniqueId
+            if (!restoredId) {
+                const prefix = (item?.id || "").split(":")[0];
+                const count = (prefixCounters.get(prefix) || 0) + 1;
+                prefixCounters.set(prefix, count);
+                restoredId = count === 1 ? prefix : `${prefix}#${count}`;
+            }
+
+            // 分配 bpmUniqueId
+            if (!(buttonEl as any).dataset) {
+                (buttonEl as any).dataset = {};
+            }
+            (buttonEl as any).dataset.bpmUniqueId = restoredId;
+        });
+
+        // 确保样式已应用（使用已保存的配置）
+        this.manager.updateRibbonStyles();
     }
 
     private getRibbonFallbackIcon(item: RibbonItem): string {
-        const source = `${item.id} ${item.name} ${item.icon || ""}`.toLowerCase();
+        const source = `${item.bpmUniqueId} ${item.name} ${item.icon || ""}`.toLowerCase();
         if (
             source.includes("refresh") ||
             source.includes("reload") ||
@@ -111,19 +174,114 @@ export class RibbonModal extends Modal {
 
     renderDraggableList(containerEl: HTMLElement) {
         const t = (k: string) => this.manager.translator.t(k);
+        const allItems = this.manager.settings.RIBBON_SETTINGS;
+
+        // 统计数量
+        const visibleCount = allItems.filter(item => item.visible).length;
+        const hiddenCount = allItems.filter(item => !item.visible).length;
+
+        // 过滤按钮组和搜索框
+        const filterBar = containerEl.createDiv("ribbon-manager-filter-bar");
+
+        // 左侧：过滤按钮组
+        const filterGroup = filterBar.createDiv("ribbon-manager-filter-group");
+
+        const filters = [
+            { key: "all" as const, label: "全部", count: allItems.length, icon: "menu" },
+            { key: "visible" as const, label: "显示", count: visibleCount, icon: "eye" },
+            { key: "hidden" as const, label: "隐藏", count: hiddenCount, icon: "eye-off" }
+        ];
+
+        filters.forEach((filter) => {
+            const btn = new ButtonComponent(filterGroup);
+            btn.buttonEl.addClass("ribbon-filter-btn");
+            if (this.currentFilter === filter.key) {
+                btn.buttonEl.addClass("is-active");
+            }
+
+            // 自定义按钮内容：图标 + 文本 + 数量
+            btn.buttonEl.empty();
+            const iconEl = btn.buttonEl.createSpan({ cls: "ribbon-filter-btn-icon" });
+            setIcon(iconEl, filter.icon);
+            btn.buttonEl.createSpan({ text: `${filter.label} ${filter.count}`, cls: "ribbon-filter-btn-text" });
+
+            btn.onClick(() => {
+                this.currentFilter = filter.key;
+                this.displayWithoutSearch();
+            });
+        });
+
+        // 右侧：搜索框
+        const searchContainer = filterBar.createDiv("ribbon-manager-search-container");
+        const searchWrapper = searchContainer.createDiv("ribbon-search-wrapper");
+        const searchIconEl = searchWrapper.createDiv("ribbon-search-icon");
+        setIcon(searchIconEl, "search");
+
+        const searchInput = new TextComponent(searchWrapper);
+        searchInput.setPlaceholder("搜索 ribbons");
+        searchInput.inputEl.addClass("ribbon-search-input");
+
+        if (this.searchQuery) {
+            searchInput.setValue(this.searchQuery);
+        }
+
+        searchInput.onChange((value) => {
+            this.searchQuery = value;
+            this.renderFilteredList(containerEl, listContainer);
+        });
+
         const listContainer = containerEl.createDiv("draggable-list-container");
-        const items = this.manager.settings.RIBBON_SETTINGS;
+        this.renderFilteredList(containerEl, listContainer);
+    }
+
+    displayWithoutSearch(targetEl?: HTMLElement, showToolbar = this.renderToolbarInRoot) {
+        const contentEl = targetEl || this.renderRootEl || this.contentEl;
+        this.renderRootEl = contentEl;
+        this.renderToolbarInRoot = showToolbar;
+        contentEl.empty();
+        if (!this.manager.isRibbonManagerEnabled()) return;
+
+        if (showToolbar) this.renderToolbar(contentEl);
+        this.renderDraggableList(contentEl);
+    }
+
+    renderFilteredList(containerEl: HTMLElement, listContainer: HTMLElement) {
+        listContainer.empty();
+        const allItems = this.manager.settings.RIBBON_SETTINGS;
+
+        // 根据过滤器筛选项目
+        let items = allItems;
+        if (this.currentFilter === "visible") {
+            items = allItems.filter(item => item.visible);
+        } else if (this.currentFilter === "hidden") {
+            items = allItems.filter(item => !item.visible);
+        }
+
+        // 根据搜索词过滤
+        if (this.searchQuery && this.searchQuery.trim()) {
+            const query = this.searchQuery.toLowerCase().trim();
+            items = items.filter(item => {
+                const name = (item.name || "").toLowerCase();
+                const id = (item.bpmUniqueId || "").toLowerCase();
+                return name.includes(query) || id.includes(query);
+            });
+        }
 
         if (items.length === 0) {
             listContainer.createEl("p", { text: this.manager.translator.t("Ribbon_无项目") });
             return;
         }
 
-        items.forEach((item, index) => {
+        const t = (k: string) => this.manager.translator.t(k);
+
+        items.forEach((item, displayIndex) => {
+            // 使用实际配置的 order 作为序号，而不是过滤后的索引
+            const actualOrder = item.order ?? displayIndex;
             const setting = new Setting(listContainer);
             const itemEl = setting.settingEl;
             itemEl.addClass("draggable-item");
-            itemEl.setAttr("data-index", index);
+            itemEl.setAttr("data-index", displayIndex.toString());
+            itemEl.setAttr("data-item-id", item.bpmUniqueId);
             itemEl.toggleClass("is-hidden", !item.visible);
             setting.nameEl.addClass("ribbon-manager-item-name-root");
             setting.controlEl.addClass("ribbon-manager-item-control-root");
@@ -132,7 +290,7 @@ export class RibbonModal extends Modal {
             const itemContent = setting.nameEl.createDiv({ cls: "draggable-item-content" });
 
             const orderEl = itemContent.createDiv({ cls: "ribbon-manager-item-order" });
-            orderEl.setText(`${index + 1}`.padStart(2, "0"));
+            orderEl.setText(`${actualOrder + 1}`.padStart(2, "0"));
 
             // 图标
             const iconEl = itemContent.createDiv({ cls: "setting-item-icon" });
@@ -148,10 +306,6 @@ export class RibbonModal extends Modal {
                 text: item.visible ? t("管理器_状态_显示中") : t("管理器_状态_已隐藏"),
                 cls: `ribbon-manager-item-state ${item.visible ? "is-visible" : "is-hidden"}`
             });
-            textWrap.createDiv({
-                text: item.id,
-                cls: "ribbon-manager-item-id"
-            });
 
             const controlBar = setting.controlEl.createDiv({ cls: "ribbon-manager-control-bar" });
 
@@ -165,7 +319,7 @@ export class RibbonModal extends Modal {
                     item.visible = newValue;
 
                     await this.persistRibbonConfig();
-                    this.display();
+                    this.displayWithoutSearch();
                 });
 
             // 拖拽手柄
@@ -175,22 +329,22 @@ export class RibbonModal extends Modal {
             });
             setIcon(handle, "grip-vertical");
             handle.setAttr("draggable", "true");
-            handle.addEventListener("pointerdown", (e) => this.startDrag(itemEl, index, e));
+            handle.addEventListener("pointerdown", (e) => this.startDrag(itemEl, displayIndex, item, e));
             // 阻止原生拖拽，使用 pointer events 模拟
             handle.addEventListener("dragstart", (e) => e.preventDefault());
         });
     }
 
-    startDrag(itemEl: HTMLElement, index: number, e: PointerEvent) {
+    startDrag(itemEl: HTMLElement, displayIndex: number, draggedItem: RibbonItem, e: PointerEvent) {
         if (e.target && (e.target as Element).setPointerCapture) {
             (e.target as Element).setPointerCapture(e.pointerId);
         }
 
         this.draggedItemEl = itemEl;
-        this.dragStartIndex = index;
+        this.dragStartIndex = displayIndex;
+        this.draggedItem = draggedItem;
 
         const rect = itemEl.getBoundingClientRect();
-        // const containerRect = itemEl.parentElement!.getBoundingClientRect();
 
         this.dragOffsetX = e.clientX - rect.left;
         this.dragOffsetY = e.clientY - rect.top;
@@ -261,17 +415,23 @@ export class RibbonModal extends Modal {
     }
 
     private handleDragEnd = async (e: PointerEvent) => {
-        if (!this.draggedItemEl || !this.placeholderEl) return;
+        if (!this.draggedItemEl || !this.placeholderEl || !this.draggedItem) return;
 
         const listContainer = this.placeholderEl.parentNode!;
 
-        // 计算新索引
-        let newIndex = 0;
+        // 找到 placeholder 之前的元素
+        let targetElement: Element | null = null;
         const children = Array.from(listContainer.children);
-        for (const child of children) {
-            if (child === this.placeholderEl) break;
-            if (child.matches(".draggable-item:not(.dragging)")) {
-                newIndex++;
+        for (let i = 0; i < children.length; i++) {
+            if (children[i] === this.placeholderEl) {
+                // 找到 placeholder 前一个非拖拽元素
+                for (let j = i - 1; j >= 0; j--) {
+                    if (children[j].matches(".draggable-item:not(.dragging)")) {
+                        targetElement = children[j];
+                        break;
+                    }
+                }
+                break;
             }
         }
 
@@ -284,16 +444,59 @@ export class RibbonModal extends Modal {
         }
 
         this.draggedItemEl.removeClass("dragging");
-        const oldIndex = this.dragStartIndex;
-
         activeDocument.removeEventListener("pointermove", this.handleDragMove);
+
+        // 读取目标元素的 item-id 并更新实际的 order
+        if (targetElement) {
+            const targetItemId = targetElement.getAttribute("data-item-id");
+            const allItems = this.manager.settings.RIBBON_SETTINGS;
+            const targetItem = allItems.find(item => item.bpmUniqueId === targetItemId);
+
+            if (targetItem && this.draggedItem) {
+                // 获取目标项的 order，拖拽项插入到其后
+                const targetOrder = targetItem.order ?? 0;
+                const draggedOrder = this.draggedItem.order ?? 0;
+
+                // 更新所有项的 order
+                allItems.forEach(item => {
+                    if (item === this.draggedItem) {
+                        item.order = targetOrder + 1;
+                    } else if (draggedOrder < targetOrder) {
+                        // 向下拖拽
+                        if ((item.order ?? 0) > draggedOrder && (item.order ?? 0) <= targetOrder) {
+                            item.order = (item.order ?? 0) - 1;
+                        }
+                    } else {
+                        // 向上拖拽
+                        if ((item.order ?? 0) >= targetOrder + 1 && (item.order ?? 0) < draggedOrder) {
+                            item.order = (item.order ?? 0) + 1;
+                        }
+                    }
+                });
+
+                // 重新排序
+                allItems.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+                allItems.forEach((item, index) => {
+                    item.order = index;
+                });
+
+                await this.manager.saveSettings();
+
+                // 只应用配置到内存，不要调用 syncRibbonConfig（避免覆盖刚保存的配置）
+                const orderedIds = allItems.map(i => i.bpmUniqueId);
+                const hiddenStatus: Record<string, boolean> = {};
+                allItems.forEach(i => hiddenStatus[i.bpmUniqueId] = !i.visible);
+                this.manager.applyRibbonConfigToMemory(orderedIds, hiddenStatus);
+                this.manager.updateRibbonStyles();
+            }
+        }
+
         this.draggedItemEl = null;
         this.dragStartIndex = -1;
+        this.draggedItem = null;
         this.activePointerId = null;
 
-        if (newIndex !== oldIndex) {
-            await this.moveItem(oldIndex, newIndex);
-        }
+        this.displayWithoutSearch();
     }
 
     async moveItem(oldIndex: number, newIndex: number) {
@@ -319,9 +522,9 @@ export class RibbonModal extends Modal {
         items.forEach((item, idx) => item.order = idx);
         await this.manager.saveSettings();
 
-        const orderedIds = items.map(i => i.id);
+        const orderedIds = items.map(i => i.bpmUniqueId);
         const hiddenStatus: Record<string, boolean> = {};
-        items.forEach(i => hiddenStatus[i.id] = !i.visible);
+        items.forEach(i => hiddenStatus[i.bpmUniqueId] = !i.visible);
         this.manager.applyRibbonConfigToMemory(orderedIds, hiddenStatus);
 
         // @ts-ignore
@@ -332,13 +535,13 @@ export class RibbonModal extends Modal {
         if (!this.manager.isRibbonManagerEnabled()) return;
 
         const items = this.manager.settings.RIBBON_SETTINGS;
-        items.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+        items.sort((a, b) => (a.name || a.bpmUniqueId).localeCompare(b.name || b.bpmUniqueId));
         items.forEach((item, idx) => {
             item.visible = true;
             item.order = idx;
         });
         await this.persistRibbonConfig();
-        this.display();
+        this.displayWithoutSearch();
     }
 
     onClose() {
