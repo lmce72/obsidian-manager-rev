@@ -544,12 +544,13 @@ export default class Manager extends Plugin {
 
         this.ensureSystemRibbonManager();
         this.updateRibbonStyles();
-        if (Platform.isMobile) {
+        if (Platform.isPhone) {
+            // 手机端使用菜单结构，需要监听菜单 DOM 变化
             this.setupMenuObserver();
         } else {
-            // 仅桌面端启用”拖出即隐藏”功能
+            // 桌面端和平板端启用”拖出即隐藏”功能
             this.setupDragToHideObserver();
-            // 桌面端启用 Ribbon DOM 监听器，应对其他插件干预
+            // 桌面端和平板端启用 Ribbon DOM 监听器，应对其他插件干预
             this.setupRibbonDomObserver();
         }
     }
@@ -1587,13 +1588,15 @@ export default class Manager extends Plugin {
             return;
         }
 
-        if (Platform.isMobile) {
+        // 只有手机端使用菜单结构，平板端使用桌面 Ribbon 结构
+        if (Platform.isPhone) {
             activeDocument
                 .querySelectorAll<HTMLElement>(".menu-scroll")
                 .forEach((menuScroll) => this.processMenuItems(menuScroll));
             return;
         }
 
+        // 桌面端和平板端都使用这个逻辑
         const ribbonElements = Array.from(
             activeDocument.querySelectorAll<HTMLElement>(".side-dock-actions div.clickable-icon.side-dock-ribbon-action")
         );
