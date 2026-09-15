@@ -8391,6 +8391,143 @@ body.theme-dark {
     font-size: 13px;
 }
 
+/* Ribbon è¿‡æ»¤æŒ‰é’®ç»„ */
+.ribbon-manager-filter-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    gap: 12px;
+}
+
+.ribbon-manager-filter-group {
+    display: inline-flex;
+    gap: 8px;
+    padding: 4px;
+    background: var(--background-modifier-form-field);
+    border-radius: var(--radius-m);
+}
+
+.ribbon-filter-btn {
+    display: flex !important;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px !important;
+    background: transparent !important;
+    border: none !important;
+    color: var(--text-muted) !important;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: var(--radius-s);
+    transition: all 0.2s ease;
+    cursor: pointer;
+}
+
+.ribbon-filter-btn-icon {
+    display: flex;
+    align-items: center;
+    width: 16px;
+    height: 16px;
+}
+
+.ribbon-filter-btn-icon svg {
+    width: 16px;
+    height: 16px;
+}
+
+.ribbon-filter-btn-text {
+    white-space: nowrap;
+}
+
+.ribbon-filter-btn:hover {
+    background: var(--background-modifier-hover) !important;
+    color: var(--text-normal) !important;
+}
+
+.ribbon-filter-btn.is-active {
+    background: var(--interactive-accent) !important;
+    color: var(--text-on-accent) !important;
+}
+
+.ribbon-filter-btn.is-active .ribbon-filter-btn-icon {
+    color: var(--text-on-accent) !important;
+}
+
+/* Ribbon æœç´¢æ¡† */
+.ribbon-manager-search-container {
+    flex: 0 0 auto;
+}
+
+.ribbon-search-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.ribbon-search-icon {
+    position: absolute;
+    left: 10px;
+    display: flex;
+    align-items: center;
+    color: var(--text-muted);
+    pointer-events: none;
+    z-index: 1;
+}
+
+.ribbon-search-icon svg {
+    width: 14px;
+    height: 14px;
+}
+
+.ribbon-search-input {
+    width: 200px;
+    padding: 6px 12px 6px 32px !important;
+    font-size: 13px;
+    border-radius: var(--radius-s);
+    border: 1px solid var(--background-modifier-border);
+    background: var(--background-primary);
+    transition: border-color 0.2s ease;
+}
+
+.ribbon-search-input:focus {
+    border-color: var(--interactive-accent);
+    outline: none;
+}
+
+/* Ribbon ¾nePíI token
+   Lbï ribbon b/ .manager-container …„ .manager-ribbon-pageïô¥çíI token
+   FK:ïåìË!F .modal.ribbon-manager-modal S öVHþ
+¡	ûUð --bpm-* „
+   ¹hüôþæG:ø/•r÷½¶öÊIV --bpm-* „7ta1H
+    .manager-container / .manager-version-picker I¹hÝ W+ */
+.ribbon-manager-modal {
+    --bpm-radius: var(--bpm-ui-radius);
+    --bpm-radius-sm: var(--bpm-ui-radius-sm);
+    --bpm-border: var(--bpm-ui-border);
+    --bpm-surface: var(--bpm-ui-surface);
+    --bpm-card: var(--bpm-ui-card);
+    --bpm-card-muted: var(--bpm-ui-card-muted);
+    --bpm-card-hover: var(--bpm-ui-card-hover);
+    --bpm-muted: var(--bpm-ui-muted);
+    --bpm-muted-strong: var(--bpm-ui-muted-strong);
+    --bpm-accent-soft: var(--bpm-ui-accent-soft);
+    --bpm-ring: var(--bpm-ui-ring);
+    --bpm-shadow: var(--bpm-ui-shadow);
+    --bpm-shadow-hover: var(--bpm-ui-shadow-hover);
+    --bpm-content-padding: var(--bpm-ui-content-padding);
+    --bpm-content-padding-mobile: var(--bpm-ui-content-padding-mobile);
+    --bpm-item-gap: var(--bpm-ui-card-gap);
+    --bpm-item-padding: var(--bpm-ui-item-padding);
+    --bpm-row-gap: var(--bpm-ui-row-gap);
+    --bpm-control-size: var(--bpm-ui-control-size);
+    --bpm-action-size: var(--bpm-ui-action-size);
+    --bpm-touch-size: var(--bpm-ui-touch-size);
+    --bpm-icon-tile: var(--bpm-ui-icon-tile);
+    --bpm-icon-size: var(--bpm-ui-icon-size);
+    --bpm-chip-height: var(--bpm-ui-chip-height);
+    --bpm-chip-padding: var(--bpm-ui-chip-padding);
+}
+
 .ribbon-manager-modal .draggable-list-container {
     display: flex;
     flex-direction: column;
@@ -8398,7 +8535,12 @@ body.theme-dark {
     padding: 0;
 }
 
-.ribbon-manager-modal .draggable-item {
+/* LC ,«1/ Obsidian „ .setting-item!F…„
+   .modal:not(.mod-settings) .setting-item:not(.setting-item-heading):where(...) Äå (0,4,0)
+   ð† background-color: transparent / padding / border-radius: 0àdåLÄ
+   Å{¾0 (0,5,0) MýH:not(.drag-ghost) såÐCMÖý}uo,( body 
+   (,¹h…Eå&šR:	÷ÿS\—Y d */
+.ribbon-manager-modal .draggable-list-container .setting-item.draggable-item:not(.drag-ghost) {
     position: relative;
     display: flex;
     align-items: center;
@@ -8415,12 +8557,12 @@ body.theme-dark {
     transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.ribbon-manager-modal .draggable-item:hover {
+.ribbon-manager-modal .draggable-list-container .setting-item.draggable-item:not(.drag-ghost):hover {
     border-color: color-mix(in srgb, var(--text-muted) 38%, var(--bpm-border));
     background: color-mix(in srgb, var(--bpm-muted) 44%, var(--bpm-card));
 }
 
-.ribbon-manager-modal .draggable-item.is-hidden {
+.ribbon-manager-modal .draggable-list-container .setting-item.draggable-item:not(.drag-ghost).is-hidden {
     background: color-mix(in srgb, var(--bpm-muted) 58%, var(--bpm-card));
 }
 
@@ -8482,6 +8624,13 @@ body.theme-dark {
     width: 16px;
     height: 16px;
     stroke-width: 2.2;
+}
+
+/* Ï„þæGtWl:-'p>:„ accent E•bùÔ */
+.ribbon-manager-modal .draggable-item.is-hidden .setting-item-icon {
+    border-color: color-mix(in srgb, var(--text-muted) 34%, var(--bpm-border));
+    background: var(--bpm-muted);
+    color: var(--text-muted);
 }
 
 .ribbon-manager-item-text {
@@ -9854,7 +10003,7 @@ body.theme-dark {
 .manager-hidden-card,
 .manager-transfer-card,
 .manager-transfer-result,
-.ribbon-manager-modal .draggable-item,
+.ribbon-manager-modal .draggable-list-container .setting-item.draggable-item:not(.drag-ghost),
 .manager-install__history,
 .manager-install__release,
 .manager-troubleshoot__header,
@@ -12146,7 +12295,7 @@ body.theme-dark .manager-transfer-segment[data-state="active"]:hover {
 .manager-hidden-card,
 .manager-transfer-card,
 .manager-transfer-result,
-.ribbon-manager-modal .draggable-item,
+.ribbon-manager-modal .draggable-list-container .setting-item.draggable-item:not(.drag-ghost),
 .manager-install__history,
 .manager-install__release,
 .manager-troubleshoot__header,

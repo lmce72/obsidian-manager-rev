@@ -45,68 +45,8 @@ export class RibbonModal extends Modal {
     async syncRibbonItems() {
         if (!this.manager.isRibbonManagerEnabled()) return;
 
-        // 只为 Ribbon 项分配 bpmUniqueId（如果还没有的话）
-        const memoryItems = (this.app.workspace as any).leftRibbon?.items || [];
-        const currentSettings = this.manager.settings.RIBBON_SETTINGS || [];
-
-        // 建立已保存配置的映射（用于恢复 bpmUniqueId）
-        const savedSettingsMap = new Map<string, RibbonItem>();
-        currentSettings.forEach((item) => {
-            if (item.bpmUniqueId) {
-                savedSettingsMap.set(item.bpmUniqueId, item);
-            }
-            if (item.name) {
-                savedSettingsMap.set(`name:${item.name}`, item);
-            }
-            if (item.ribbonIdMap) {
-                Object.values(item.ribbonIdMap).forEach(id => {
-                    if (id) savedSettingsMap.set(`ribbonId:${id}`, item);
-                });
-            }
-        });
-
-        // 为内存项分配 bpmUniqueId，优先使用已保存的配置
-        const prefixCounters = new Map<string, number>();
-        memoryItems.forEach((item: any) => {
-            const buttonEl = item?.buttonEl;
-            if (!buttonEl) return;
-
-            // 如果已经有 bpmUniqueId，跳过
-            if ((buttonEl as any).dataset?.bpmUniqueId) return;
-
-            // 尝试从已保存配置中恢复 bpmUniqueId
-            let restoredId: string | null = null;
-
-            // 方法1: 通过 name 匹配
-            if (item.title) {
-                const savedItem = savedSettingsMap.get(`name:${item.title}`);
-                if (savedItem) {
-                    restoredId = savedItem.bpmUniqueId;
-                }
-            }
-
-            // 方法2: 通过 ribbonId 匹配
-            if (!restoredId && item.id) {
-                const savedItem = savedSettingsMap.get(`ribbonId:${item.id}`);
-                if (savedItem) {
-                    restoredId = savedItem.bpmUniqueId;
-                }
-            }
-
-            // 方法3: 如果无法恢复，分配新的 bpmUniqueId
-            if (!restoredId) {
-                const prefix = (item?.id || "").split(":")[0];
-                const count = (prefixCounters.get(prefix) || 0) + 1;
-                prefixCounters.set(prefix, count);
-                restoredId = count === 1 ? prefix : `${prefix}#${count}`;
-            }
-
-            // 分配 bpmUniqueId
-            if (!(buttonEl as any).dataset) {
-                (buttonEl as any).dataset = {};
-            }
-            (buttonEl as any).dataset.bpmUniqueId = restoredId;
-        });
+        // 身份恢复统一由 Manager 提供（与启动、监听复位共用同一实现）
+        this.manager.assignRibbonRuntimeIds();
 
         // 确保样式已应用（使用已保存的配置）
         this.manager.updateRibbonStyles();
