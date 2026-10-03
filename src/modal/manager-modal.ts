@@ -18,6 +18,7 @@ import {
 import { BetaSource, BPM_IGNORE_TAG, EONDR_PLUGIN_TAG_ID, InstallHistoryItem, ManagerPlugin, PluginLayoutItem } from "../data/types";
 import { AppearanceProfile, AppearanceProfileMode, DEFAULT_MAIN_PAGE_ACTION_PLACEMENT, FilterOperator, MainPageActionId, ManagerSettings, PluginOverviewSort } from "../settings/data";
 import { confirmWithModal, managerOpen } from "../utils";
+import { describeHeapDelta, readHeapMB, RECLAIM_NOTICE_THRESHOLD_MB, RECLAIM_SETTLE_MS } from "../memory-reclaim";
 
 import Manager from "main";
 import { GroupModal } from "./group-modal";
@@ -1627,11 +1628,30 @@ export class ManagerModal extends Modal {
     }
 
     private async restartPlugin(plugin: PluginManifest) {
+        const heapBefore = readHeapMB();
         new Notice(this.manager.translator.t("管理器_重启中_提示"));
         await this.appPlugins.disablePluginAndSave(plugin.id);
         await this.appPlugins.enablePluginAndSave(plugin.id);
         this.singleStartedPluginIds.delete(plugin.id);
         this.refreshPluginCard(plugin.id, { allowReload: true });
+        void this.reportRestartCost(plugin.id, heapBefore);
+    }
+
+    /**
+     * Reports what a restart cost, once the plugin has had a moment to settle.
+     *
+     * Measuring cannot give the memory back — see `memory-reclaim.ts` for why no plugin can force
+     * a collection, and why one would not help: the previous instance is retained, not garbage. What
+     * it does is make the cost visible, so restarting something that rebuilds a large cache on load
+     * is a deliberate choice rather than a free one.
+     */
+    private async reportRestartCost(pluginId: string, heapBefore: number | null): Promise<void> {
+        await new Promise((resolve) => window.setTimeout(resolve, RECLAIM_SETTLE_MS));
+        const delta = describeHeapDelta(heapBefore, readHeapMB());
+        if (!delta) return;
+        if (Math.abs(delta.deltaMB) >= RECLAIM_NOTICE_THRESHOLD_MB) {
+            new Notice(`${pluginId}: ${delta.label}`, 5000);
+        }
     }
 
     private async enableBpmIgnoredPlugin(plugin: PluginManifest, managerPlugin: ManagerPlugin) {
@@ -1642,6 +1662,8 @@ export class ManagerModal extends Modal {
         await this.manager.savePluginAndExport(plugin.id);
         this.singleStartedPluginIds.delete(plugin.id);
         Commands(this.app, this.manager);
+        // 该插件脱离 BPM 忽略状态后其 ribbon 图标才纳入管理，登记一次
+        this.manager.applyRibbonSettings();
         new Notice(this.manager.translator.t("管理器_启用BPM忽略插件中_提示"));
         await this.reloadShowData();
     }
@@ -2059,6 +2081,8 @@ export class ManagerModal extends Modal {
         progress.hide();
         await this.manager.saveSettings();
         Commands(this.app, this.manager);
+        // 批量启停后可能出现新 ribbon 图标，统一登记一次
+        this.manager.applyRibbonSettings();
         await this.reloadShowData();
         new Notice(t("批量编辑_已更新状态", { count: plugins.length }));
     }

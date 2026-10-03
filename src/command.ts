@@ -8,6 +8,7 @@ import {
     setIcon,
 } from "obsidian";
 import Manager from "./main";
+import { describeHeapDelta, readHeapMB, RECLAIM_NOTICE_THRESHOLD_MB, RECLAIM_SETTLE_MS } from "./memory-reclaim";
 import { ManagerModal } from "./modal/manager-modal";
 import { TroubleshootModal } from "./troubleshoot/troubleshoot-modal";
 import { BPM_IGNORE_TAG, ManagerPlugin } from "./data/types";
@@ -291,6 +292,18 @@ class ManagerCommandService {
             name: this.manager.translator.t("排查_按钮_描述"),
             callback: () => { new TroubleshootModal(this.app, this.manager).open(); },
         });
+
+        // 手动兜底：把 RIBBON_SETTINGS 重新推入 Obsidian 原生侧边栏状态
+        this.addStaticCommand({
+            id: "apply-ribbon-settings",
+            name: this.t("command_apply_ribbon_settings"),
+            checkCallback: (checking) => {
+                const ready = this.manager.isRibbonManagerEnabled();
+                if (checking) return ready;
+                if (ready) this.manager.applyRibbonSettings({ notify: true });
+                return ready;
+            },
+        });
     }
 
     private refreshDynamicCommands() {
@@ -469,10 +482,25 @@ class ManagerCommandService {
         await this.runLocked(`restart:${pluginId}`, async () => {
             this.capturePreviousState(this.t("command_snapshot_restart", { name: this.getPluginName(pluginId) }));
             new Notice(this.manager.translator.t("管理器_重启中_提示"));
+            const heapBefore = readHeapMB();
             await this.manager.appPlugins.disablePluginAndSave(pluginId);
             await this.manager.appPlugins.enablePluginAndSave(pluginId);
             this.refreshAfterStatusChange([pluginId]);
+            void this.reportRestartCost(pluginId, heapBefore);
         });
+    }
+
+    /**
+     * Reports what a restart cost, once the plugin has had a moment to settle — see the same method
+     * on the manager modal, and `memory-reclaim.ts` for why nothing can hand the memory back.
+     */
+    private async reportRestartCost(pluginId: string, heapBefore: number | null): Promise<void> {
+        await new Promise((resolve) => window.setTimeout(resolve, RECLAIM_SETTLE_MS));
+        const delta = describeHeapDelta(heapBefore, readHeapMB());
+        if (!delta) return;
+        if (Math.abs(delta.deltaMB) >= RECLAIM_NOTICE_THRESHOLD_MB) {
+            new Notice(`${pluginId}: ${delta.label}`, 5000);
+        }
     }
 
     private async openPluginSettings(pluginId: string) {
@@ -543,6 +571,9 @@ class ManagerCommandService {
 
     private refreshAfterStatusChange(pluginIds: string[]) {
         this.refresh();
+        // 插件状态变更的统一收口：登记可能新出现的 ribbon 图标
+        // （显隐与顺序由 Obsidian 原生状态自行维持，无需重新打补丁）
+        this.manager.applyRibbonSettings();
         try {
             if (pluginIds.length === 0) {
                 void this.manager.managerModal?.reloadShowData();
