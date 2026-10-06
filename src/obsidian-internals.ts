@@ -62,17 +62,36 @@ export type ObsidianAppWithInternals = App & {
     };
 };
 
+/** Obsidian 内部 ribbon 项（leftRibbon.items 的元素） */
 export type RibbonNativeItem = {
+    /** 形如 "nutstore-sync:开始同步"（随语言与标题变化） */
     id?: string;
     title?: string;
     name?: string;
     ariaLabel?: string;
+    /** 图标名（插件源码常量，比标题稳定） */
     icon?: string;
+    /** 显隐由 Obsidian 原生状态承载：true 表示已隐藏 */
+    hidden?: boolean;
+    /** 插件被禁用后 buttonEl 会被删除，但条目本身保留（hidden 与位置随之存活） */
     buttonEl?: HTMLElement;
+    callback?: (...args: unknown[]) => unknown;
 };
 
+/** Obsidian 内部左ribbon（app.workspace.leftRibbon） */
 export type LeftRibbonLike = {
     items?: Array<RibbonNativeItem | null | undefined>;
+    containerEl?: HTMLElement;
+    ribbonItemsEl?: HTMLElement;
+    /** 按 items 的 hidden 重绘并重排 DOM；true 时顺带持久化到 workspace 配置 */
+    onChange?: (persist?: boolean) => void;
+    /** 序列化为 workspace 配置中的 left-ribbon 段（键顺序即显示顺序） */
+    serialize?: () => { hiddenItems?: Record<string, boolean> };
+    /**
+     * 图标注册的唯一入口：插件 addRibbonIcon 最终走到这里
+     * 新条目在这里创建（hidden 默认为 false），是设置必须重新复述的时刻
+     */
+    addRibbonItemButton?: (id: string, icon: string, title: string, callback: (...args: unknown[]) => unknown) => HTMLElement;
 };
 
 export type WorkspaceWithRibbon = Workspace & {

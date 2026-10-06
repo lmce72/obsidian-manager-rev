@@ -14,7 +14,7 @@ import { performSelfCheck } from './self-check';
 import { SystemRibbonManager } from './manager/system-ribbon-manager';
 import { RibbonItem } from './data/types';
 import { markSourceInstalledRelease, sourceHasUpdate as sourceHasConfiguredUpdate, syncSourceReleaseCheck } from './source-release';
-import { ObsidianAppWithInternals, ObsidianPluginRegistry, RibbonNativeItem, WindowWithMoment, WorkspaceWithRibbon } from './obsidian-internals';
+import { LeftRibbonLike, ObsidianAppWithInternals, ObsidianPluginRegistry, RibbonNativeItem, WindowWithMoment, WorkspaceWithRibbon } from './obsidian-internals';
 import { RibbonModal } from './modal/ribbon-modal';
 import { githubProxyEnabled, resolveGithubUrl } from './github-url';
 
@@ -85,14 +85,15 @@ export default class Manager extends Plugin {
     private draggedRibbonItem: HTMLElement | null = null;
     private dragObserverCleanup: (() => void) | null = null;
 
-    // Ribbon DOM 监听器，用于应对其他插件干预
-    private ribbonDomObserver: MutationObserver | null = null;
-    /** 监听器当前绑定的容器，容器被 Obsidian 重建时需要重新绑定 */
-    private ribbonObserverRoot: HTMLElement | null = null;
-    /** ribbon 结构变化的完整复位防抖句柄 */
-    private ribbonResyncDebouncer: number | null = null;
-    /** 同一轮变化内的自愈重试次数（应对插件分步注册 DOM 的竞态） */
-    private ribbonResyncAttempts = 0;
+    /** 卸载后禁止一切延迟回调再动 ribbon（避免在已卸载的插件上复活） */
+    private isUnloaded = false;
+
+    /** 原生条目创建入口的原始引用（挂钩子用），卸载时原样还原 */
+    private ribbonAddItemOriginal: LeftRibbonLike["addRibbonItemButton"] | null = null;
+    /** 新条目注册后的补应用防抖句柄 */
+    private ribbonItemApplyTimer: number | null = null;
+    /** 启动后分批加载的补应用句柄 */
+    private ribbonSettleTimers: number[] = [];
 
     public async onload() {
         this.appPlugins = (this.app as ObsidianAppWithInternals).plugins;
@@ -142,10 +143,9 @@ export default class Manager extends Plugin {
 
         this.repoResolver = new RepoResolver(this);
 
-        // 早期清理（如果 Ribbon Manager 被禁用）
-        if (!this.isRibbonManagerEnabled()) {
-            this.clearRibbonStyleOverrides();
-        }
+        // 一次性清理旧版本留下的 inline 覆盖（旧机制在元素上写 display/order，
+        // 在线升级后若不剥掉会与 Obsidian 原生状态互相打架）
+        this.clearLegacyRibbonOverrides();
 
         // 初始化侧边栏图标
         this.addRibbonIcon('folder-cog', this.translator.t('通用_管理器_文本'), () => { this.managerModal = new ManagerModal(this.app, this); this.managerModal.open(); });
@@ -173,41 +173,33 @@ export default class Manager extends Plugin {
         });
 
         this.app.workspace.onLayoutReady(() => {
-            // 修复：延迟到 layoutReady 后同步 Ribbon 配置，确保所有插件（包括延迟启动的）都已加载
-            if (this.isRibbonManagerEnabled()) {
-                void this.syncStoredRibbonConfig();
-            }
             this.startRibbonRuntimeFeatures();
-            // 容器可能被 Obsidian 重建，重建后监听器会失效，需重新绑定
+
+            // 延迟加载的插件可能带来新图标，需要登记进 RIBBON_SETTINGS；
+            // 显隐与顺序由 Obsidian 原生状态承载，这里只补登记，不再需要「重绘后重新打补丁」
             this.registerEvent(this.app.workspace.on("layout-change", () => {
-                this.ensureRibbonObserverBinding();
+                if (this.isRibbonManagerEnabled()) this.applyRibbonSettings();
             }));
+
             // 延迟启动自检，确保 Obsidian 初始化完成，避免自动接管被覆盖
             window.setTimeout(() => {
-                // 完整复位：清理 + 重建身份 + 登记新项 + 应用样式（不再只做局部处理）
-                if (this.isRibbonManagerEnabled()) void this.resyncRibbonRuntime();
                 if (this.settings.DELAY) void performSelfCheck(this);
             }, 2000);
-
-            // 额外的延迟检查，应对更晚加载的插件
-            if (this.isRibbonManagerEnabled()) {
-                window.setTimeout(() => {
-                    void this.resyncRibbonRuntime();
-                }, 5000);
-            }
         });
     }
 
     public onunload() {
+        // 卸载后一切延迟回调必须停手，否则会在已卸载的插件上继续操作 ribbon
+        this.isUnloaded = true;
         this.stopRibbonRuntimeFeatures();
 
-        if (this.settings.DELAY) void this.disableDelaysForAllPlugins();
-
-        // 临走前再清理一次
-        if (this.isRibbonManagerEnabled()) this.cleanRibbonItems();
-
-        this.systemRibbonManager?.stopWatch();
-        this.clearRibbonStyleOverrides();
+        // 注意：卸载时【绝不】改动插件的启用状态。
+        // 卸载无法区分「App 退出 / 插件重载 / 用户停用 BPM」三种情形，
+        // 而「把延迟插件交回 Obsidian 托管」本质上等同于把延时开关关掉：
+        // 它会把全部延迟插件写进 community-plugins.json（enablePluginAndSave 会落盘），
+        // 于是每次重载 BPM 都会改写用户配置、让 Obsidian 直接启动这些插件，
+        // 延时启动随之失效，并被 BPM 自检报成「非 BPM 管理的插件」。
+        // 交接只在用户显式关闭延时开关时进行（见 disableDelaysForAllPlugins 的调用点）。
     }
 
     private setupDragToHideObserver() {
@@ -238,183 +230,284 @@ export default class Manager extends Plugin {
     }
 
     /**
-     * 设置 Ribbon DOM 监听器，应对其他插件干预导致的样式覆盖
-     * 监听 Ribbon 容器的 DOM 变化，自动重新应用设置
+     * 一次性清理旧版本留下的 inline 覆盖
+     * 旧机制把 display / order 写在元素 style 上并留 data-bpm-* 标记；
+     * 新机制改用 Obsidian 原生状态承载，这些残留必须剥掉，否则两边互相打架
      */
-    private setupRibbonDomObserver() {
-        if (!this.isRibbonManagerEnabled() || this.ribbonDomObserver) return;
+    private clearLegacyRibbonOverrides() {
+        activeDocument
+            .querySelectorAll<HTMLElement>('[data-bpm-ribbon-managed], [data-bpm-menu-managed]')
+            .forEach((element) => {
+                const originalDisplay = element.getAttribute("data-bpm-original-display");
+                const originalOrder = element.getAttribute("data-bpm-original-order");
 
-        const ribbonContainer = activeDocument.querySelector('.side-dock-actions');
-        if (!ribbonContainer) {
-            // 容器尚未加载，稍后重试
-            window.setTimeout(() => this.setupRibbonDomObserver(), 500);
-            return;
-        }
+                if (originalDisplay !== null) element.style.display = originalDisplay;
+                else element.style.removeProperty("display");
 
-        this.ribbonDomObserver = new MutationObserver((mutations) => {
-            if (!this.isRibbonManagerEnabled()) return;
+                if (originalOrder !== null) element.style.order = originalOrder;
+                else element.style.removeProperty("order");
 
-            let shouldReapply = false;
+                element.removeAttribute("data-bpm-ribbon-managed");
+                element.removeAttribute("data-bpm-menu-managed");
+                element.removeAttribute("data-bpm-original-display");
+                element.removeAttribute("data-bpm-original-order");
+            });
+    }
 
-            for (const mutation of mutations) {
-                // 检测新增或删除的 Ribbon 图标
-                if (mutation.type === 'childList' && (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)) {
-                    shouldReapply = true;
-                    break;
-                }
-
-                // 检测样式属性被修改（其他插件可能覆盖了 display 或 order）
-                if (mutation.type === 'attributes') {
-                    const target = mutation.target as HTMLElement;
-                    if (target.classList?.contains('side-dock-ribbon-action')) {
-                        const attrName = mutation.attributeName;
-                        if (attrName === 'style' || attrName === 'class') {
-                            // 检查是否是我们管理的元素
-                            if (target.hasAttribute('data-bpm-ribbon-managed')) {
-                                shouldReapply = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (shouldReapply) {
-                // 使用防抖避免频繁重绘
-                // 必须是完整复位：只应用样式无法重建丢失的身份，插件更新后设置就会失效
-                this.ribbonResyncAttempts = 0;
-                this.scheduleRibbonResync();
-            }
-        });
-
-        // 监听子节点变化和属性变化
-        this.ribbonDomObserver.observe(ribbonContainer, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['style', 'class']
-        });
-        this.ribbonObserverRoot = ribbonContainer as HTMLElement;
+    /** 取左ribbon 的原生对象（显隐与顺序的唯一载体） */
+    private getLeftRibbon(): LeftRibbonLike | undefined {
+        return (this.app.workspace as WorkspaceWithRibbon).leftRibbon;
     }
 
     /**
-     * 确保 DOM 监听器绑定在仍然存活的 ribbon 容器上
-     * Obsidian 重建容器后旧监听器会静默失效，导致此后所有 ribbon 变化都不再触发复位
+     * 应用 Ribbon 设置（唯一入口）
+     *
+     * 机制：把设置写进 Obsidian 原生状态 —— `items[].hidden` 与 `items` 顺序，
+     * 再交给 `leftRibbon.onChange()` 重绘与持久化。原生状态由 Obsidian 自己维护，
+     * 插件开关、界面重绘都不需要 BPM 重新打补丁，因此不再需要 DOM 观察器与自愈重试。
+     *
+     * 顺序权威属于 BPM 面板：在侧边栏直接用 Obsidian 原生拖拽排序，会被下一次应用覆盖。
+     *
+     * @param options.notify 为真时弹出结果提示（命令面板路径使用）
      */
-    private ensureRibbonObserverBinding() {
-        if (!this.isRibbonManagerEnabled() || Platform.isPhone) return;
-
-        const container = activeDocument.querySelector<HTMLElement>('.side-dock-actions');
-        if (!container) return;
-        if (this.ribbonDomObserver && this.ribbonObserverRoot === container) return;
-
-        if (this.ribbonDomObserver) {
-            this.ribbonDomObserver.disconnect();
-            this.ribbonDomObserver = null;
-        }
-        this.setupRibbonDomObserver();
-    }
-
-    /**
-     * 安排一次 ribbon 完整复位（防抖）
-     * @param delay 延迟毫秒数，默认 300ms
-     */
-    private scheduleRibbonResync(delay = 300) {
-        if (this.ribbonResyncDebouncer !== null) {
-            window.clearTimeout(this.ribbonResyncDebouncer);
-        }
-        this.ribbonResyncDebouncer = window.setTimeout(() => {
-            this.ribbonResyncDebouncer = null;
-            void this.resyncRibbonRuntime();
-        }, delay);
-    }
-
-    /**
-     * ribbon 结构变化后的完整复位：清理内存 → 重建身份 → 登记新项 → 应用样式
-     * 所有「ribbon 有变化就用回设置」的入口都必须走这里，避免各处只做局部处理
-     */
-    private async resyncRibbonRuntime(): Promise<void> {
+    public applyRibbonSettings(options: { notify?: boolean } = {}): void {
+        if (this.isUnloaded) return;
         if (!this.isRibbonManagerEnabled()) return;
 
         try {
-            // 1. 清理 Obsidian 内部 items 数组中的 null/重复项，避免后续遍历读到空洞
-            this.cleanRibbonItems();
-
-            // 2. 为插件重载/更新后新建的图标重建身份（幂等，不改动已保存配置）
-            this.assignRibbonRuntimeIds();
-
-            // 3. 非破坏性登记新出现的图标，使其获得持久身份
-            if (this.appendMissingRibbonSettings()) {
-                await this.saveSettings();
+            const ribbon = this.getLeftRibbon();
+            if (!ribbon || !Array.isArray(ribbon.items) || typeof ribbon.onChange !== "function") {
+                // 原生接口缺失（Obsidian 大版本变更）时降级为只读，绝不猜测 DOM
+                console.error("[BPM] leftRibbon native API unavailable; ribbon settings not applied.");
+                if (options.notify) new Notice(this.translator.t("Ribbon_原生接口不可用"));
+                return;
             }
 
-            // 4. 应用显隐与顺序
-            this.updateRibbonStyles();
+            this.cleanRibbonItems();
+
+            const items = (ribbon.items || []).filter((item): item is RibbonNativeItem => Boolean(item));
+            const saved = this.settings.RIBBON_SETTINGS || (this.settings.RIBBON_SETTINGS = []);
+
+            if (items.length === 0) return;
+
+            this.ensureSystemRibbonManager();
+            const resolutions = this.systemRibbonManager?.resolve(saved, items) || [];
+
+            // 1. 登记 BPM 尚未见过的新图标；同步已登记条目漂移掉的标识字段
+            let settingsDirty = false;
+            let nextOrder = this.nextRibbonOrder(saved);
+            resolutions.forEach((resolution) => {
+                if (!resolution.setting) {
+                    const setting = this.buildRibbonSetting(resolution.item, nextOrder++, resolution.sequence);
+                    saved.push(setting);
+                    resolution.setting = setting;
+                    settingsDirty = true;
+                    if (this.settings.DEBUG) {
+                        console.log("[BPM] Ribbon item registered as new", setting.bpmUniqueId, resolution.item.id);
+                    }
+                } else if (resolution.identityDrifted) {
+                    this.syncRibbonSettingIdentity(resolution.setting, resolution.item);
+                    settingsDirty = true;
+                }
+            });
+            if (settingsDirty) void this.saveSettings();
+
+            // 2. 写原生状态：BPM 权威，覆盖原生显隐与顺序
+            let ribbonChanged = false;
+            resolutions.forEach((resolution) => {
+                const setting = resolution.setting;
+                if (!setting) return;
+                const hidden = setting.visible === false;
+                if (resolution.item.hidden !== hidden) {
+                    resolution.item.hidden = hidden;
+                    ribbonChanged = true;
+                }
+            });
+
+            const ordered = resolutions
+                .slice()
+                .sort((a, b) => this.ribbonOrderOf(a.setting) - this.ribbonOrderOf(b.setting))
+                .map((resolution) => resolution.item);
+
+            if (!this.sameRibbonOrder(items, ordered)) {
+                // 原地改写数组，保持 Obsidian 持有的引用不变（onChange 读的就是它）
+                ribbon.items?.splice(0, ribbon.items.length, ...ordered);
+                ribbonChanged = true;
+            }
+
+            // 3. 只在确有变化时重绘；持久化走唯一路径 persistRibbonConfigFile，
+            //    不调用 onChange(true)，避免与 Obsidian 自身的布局保存形成两个写入者
+            if (ribbonChanged) ribbon.onChange(false);
+            void this.persistRibbonConfigFile();
+
+            if (options.notify) {
+                new Notice(
+                    this.translator.t("command_notice_ribbon_settings_applied", { count: saved.length })
+                );
+            }
         } catch (error) {
-            console.error("[BPM] resyncRibbonRuntime failed:", error);
-        }
-
-        // 5. 自愈：插件可能分步注册 DOM（先插入元素、后设置标题），首次未命中就再补一次
-        if (this.shouldRetryRibbonResync()) {
-            this.scheduleRibbonResync(600);
-        } else {
-            this.ribbonResyncAttempts = 0;
+            console.error("[BPM] applyRibbonSettings failed:", error);
         }
     }
 
     /**
-     * 判断是否还需要再补一次复位
-     * 存在未被托管的 ribbon 图标说明本轮没有全部命中
+     * 兼容别名：显隐与顺序的应用统一走 applyRibbonSettings
+     * 保留该名字以免改动既有调用点
      */
-    private shouldRetryRibbonResync(): boolean {
-        if (Platform.isPhone || this.ribbonResyncAttempts >= 3) return false;
+    public updateRibbonStyles() {
+        this.applyRibbonSettings();
+    }
 
-        const elements = Array.from(
-            activeDocument.querySelectorAll<HTMLElement>(".side-dock-actions div.clickable-icon.side-dock-ribbon-action")
-        );
-        return elements.some((element) => !element.hasAttribute("data-bpm-ribbon-managed"));
+    // ==================== 新条目的补应用与持久化 ====================
+
+    /**
+     * 挂上「条目创建」钩子：任何 ribbon 图标被注册之后重新应用一次设置
+     *
+     * 为什么必须挂在这里：新条目出生时 `hidden` 默认 false，而 Obsidian 只在启动时
+     * 按配置 `load()` 一次，此后整个会话都不会再复述配置（实测 11 秒内 load/onChange 均 0 次）。
+     * 因此唯一可靠的时机就是「条目刚被创建」这一刻 —— 无论它由谁触发
+     * （BPM 的延时启动、Obsidian 自带的插件开关、别的插件动态注册）。
+     *
+     * 这也是替代已删除的 DOM 观察器的结构性钩子：它只在条目创建时触发，
+     * 不随容器重建而失效，也不会被无关的 DOM 变动刷屏。
+     */
+    private installRibbonItemHook(): void {
+        const ribbon = this.getLeftRibbon();
+        if (!ribbon || typeof ribbon.addRibbonItemButton !== "function") return;
+        if (this.ribbonAddItemOriginal) return;
+
+        const original = ribbon.addRibbonItemButton.bind(ribbon) as LeftRibbonLike["addRibbonItemButton"];
+        this.ribbonAddItemOriginal = original;
+        ribbon.addRibbonItemButton = (...args: Parameters<NonNullable<LeftRibbonLike["addRibbonItemButton"]>>) => {
+            const result = original?.(...args);
+            this.scheduleRibbonApplyAfterItemAdded();
+            return result as HTMLElement;
+        };
+    }
+
+    /** 还原原生创建入口（卸载/关闭接管时） */
+    private removeRibbonItemHook(): void {
+        const ribbon = this.getLeftRibbon();
+        if (ribbon && this.ribbonAddItemOriginal) {
+            ribbon.addRibbonItemButton = this.ribbonAddItemOriginal;
+        }
+        this.ribbonAddItemOriginal = null;
     }
 
     /**
-     * 非破坏性登记：把内存中存在、但设置里缺失的 ribbon 项追加进 RIBBON_SETTINGS
-     * 只追加，绝不改动已有项的 visible / order
-     * @returns 是否有新增项
+     * 条目创建后的补应用（防抖）
+     * 启动时几十个插件会连续注册图标，合并成一次应用；200ms 也留出了
+     * 插件在 addRibbonIcon 之后继续改标题/图标的余量
      */
-    private appendMissingRibbonSettings(): boolean {
-        if (!this.settings) return false;
+    private scheduleRibbonApplyAfterItemAdded(): void {
+        if (this.isUnloaded) return;
+        if (this.ribbonItemApplyTimer !== null) window.clearTimeout(this.ribbonItemApplyTimer);
+        this.ribbonItemApplyTimer = window.setTimeout(() => {
+            this.ribbonItemApplyTimer = null;
+            this.applyRibbonSettings();
+        }, 200);
+    }
 
-        const saved = this.settings.RIBBON_SETTINGS || (this.settings.RIBBON_SETTINGS = []);
-        const known = new Set(saved.filter(Boolean).map((item) => item.bpmUniqueId));
-        const memoryItems = (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items || [];
+    /**
+     * 启动后的几次兜底应用：延时启动的插件分批到位，且钩子万一在新版本里失效时
+     * 仍能收敛。次数固定、自动结束，不做常驻轮询。
+     */
+    private scheduleStartupSettleApplies(): void {
+        [3000, 8000, 15000].forEach((delay) => {
+            const handle = window.setTimeout(() => {
+                this.ribbonSettleTimers = this.ribbonSettleTimers.filter((item) => item !== handle);
+                if (this.isUnloaded) return;
+                this.applyRibbonSettings();
+            }, delay);
+            this.ribbonSettleTimers.push(handle);
+        });
+    }
 
-        let maxOrder = saved.reduce(
+    /**
+     * 把当前 ribbon 状态直写进 Obsidian 的配置文件（只改 left-ribbon 段）
+     *
+     * 为什么要直写：原生持久化依赖 `requestSaveLayout()` 的防抖与退出时机，
+     * 一旦那次写入没落地，下次启动 Obsidian 会按过期的 `hiddenItems` 复述一遍，
+     * 于是「启动后设置不生效」。直写让我们期望的状态成为磁盘上的事实，
+     * 启动时由 Obsidian 自己的 `load()` 应用。
+     *
+     * 安全约束：重新读盘后再写、只替换 left-ribbon 一个键、与现有内容一致时完全不写
+     * （避免整文件 diff 与 git 噪声）；按平台选 workspace(-mobile).json。
+     */
+    private async persistRibbonConfigFile(): Promise<void> {
+        if (this.isUnloaded) return;
+        const ribbon = this.getLeftRibbon();
+        if (!ribbon || typeof ribbon.serialize !== "function") return;
+
+        const configPath = `${this.app.vault.configDir}/${Platform.isMobile ? "workspace-mobile.json" : "workspace.json"}`;
+        try {
+            const adapter = this.app.vault.adapter;
+            if (!(await adapter.exists(configPath))) return;
+
+            const desired = ribbon.serialize();
+            const raw = await adapter.read(configPath);
+            const parsed = JSON.parse(raw) as Record<string, unknown>;
+            if (JSON.stringify(parsed["left-ribbon"]) === JSON.stringify(desired)) return;
+
+            parsed["left-ribbon"] = desired;
+            await adapter.write(configPath, JSON.stringify(parsed, null, 2));
+            if (this.settings.DEBUG) {
+                console.log("[BPM] Ribbon state written to", configPath);
+            }
+        } catch (error) {
+            console.error("[BPM] persist ribbon config failed:", error);
+        }
+    }
+
+    /** 配置项的排序键：非法 order 视为末尾（与旧机制 order=9999 的语义一致） */
+    private ribbonOrderOf(setting?: RibbonItem): number {
+        const order = setting?.order;
+        return setting && Number.isFinite(order) ? (order as number) : Number.MAX_SAFE_INTEGER;
+    }
+
+    /** 下一个可用的顺序号（新项排在末尾） */
+    private nextRibbonOrder(saved: RibbonItem[]): number {
+        return saved.reduce(
             (max, item) => (item && Number.isFinite(item.order) ? Math.max(max, item.order) : max),
             -1
-        );
-        const appended: RibbonItem[] = [];
+        ) + 1;
+    }
 
-        memoryItems.forEach((item) => {
-            const uniqueId = item?.buttonEl?.dataset?.bpmUniqueId;
-            if (!uniqueId || !item?.title || !item?.id) return;
-            if (known.has(uniqueId)) return;
-
-            known.add(uniqueId);
-            appended.push(this.buildRibbonSetting(item, ++maxOrder));
-        });
-
-        if (appended.length === 0) return false;
-        saved.push(...appended);
-        return true;
+    /** 两个内存项数组的顺序是否完全一致 */
+    private sameRibbonOrder(a: RibbonNativeItem[], b: RibbonNativeItem[]): boolean {
+        if (a.length !== b.length) return false;
+        return a.every((item, index) => item === b[index]);
     }
 
     /**
-     * 由内存项构造配置项（新项默认显示，顺序排在末尾）
+     * 同步已保存条目的标识字段（只动 name / ribbonIdMap，绝不动 visible / order）
+     * 标识字段是后续匹配的依据：插件改了标题或换了内存项 id 后，靠它重新对上
+     */
+    private syncRibbonSettingIdentity(setting: RibbonItem, item: RibbonNativeItem) {
+        if (item.title && setting.name !== item.title) {
+            setting.name = item.title;
+        }
+        if (!item.id) return;
+
+        const ribbonIdMap = setting.ribbonIdMap || (setting.ribbonIdMap = {});
+        const alreadyRecorded = Object.values(ribbonIdMap).includes(item.id);
+        if (alreadyRecorded) return;
+
+        // 语言键只影响「切语言后能否回填」，记录过就不必重复写
+        if (this.usesChineseRibbonIdMap()) ribbonIdMap.zh = item.id;
+        else ribbonIdMap.en = item.id;
+    }
+
+    /**
+     * 由内存项构造配置项（新登记的项默认显示、排在末尾）
      * @param order 分配给该项的顺序
+     * @param sequence 同一插件内的出现序号，用于生成候选身份
      * @param previous 已保存的旧项，存在时保留用户的 visible / order
      */
     private buildRibbonSetting(
         item: RibbonNativeItem,
         order: number,
+        sequence = 1,
         previous?: RibbonItem
     ): RibbonItem {
         const ribbonIdMap: RibbonItem["ribbonIdMap"] = {};
@@ -424,14 +517,33 @@ export default class Manager extends Plugin {
             ribbonIdMap.en = item.id;
         }
 
+        const pluginId = SystemRibbonManager.pluginIdOf(item.id);
+        const taken = new Set((this.settings.RIBBON_SETTINGS || []).map((entry) => entry?.bpmUniqueId));
+        const bpmUniqueId = previous?.bpmUniqueId || this.uniqueRibbonId(pluginId, sequence, taken);
+
         return {
-            bpmUniqueId: (item.buttonEl?.dataset?.bpmUniqueId as string) || "",
+            bpmUniqueId,
             name: item.title || previous?.name || "",
             icon: item.icon || previous?.icon || "help-circle",
             visible: previous ? previous.visible : true,
             order: previous ? previous.order : order,
             ribbonIdMap
         };
+    }
+
+    /**
+     * 生成不冲突的身份：首选「插件id」或「插件id#序号」，被占用则顺延
+     * 冲突时顺延而不是覆盖，避免两个图标共用同一身份
+     */
+    private uniqueRibbonId(pluginId: string, sequence: number, taken: Set<string | undefined>): string {
+        const preferred = SystemRibbonManager.candidateId(pluginId, sequence);
+        if (preferred && !taken.has(preferred)) return preferred;
+
+        for (let index = Math.max(sequence, 2); index < 1000; index++) {
+            const candidate = pluginId ? `${pluginId}#${index}` : "";
+            if (candidate && !taken.has(candidate)) return candidate;
+        }
+        return preferred || `ribbon-${Date.now()}`;
     }
 
     /**
@@ -486,53 +598,27 @@ export default class Manager extends Plugin {
             this.draggedRibbonItem = null;
     }
 
+    /**
+     * 拖拽隐藏：按标题找到对应设置并置为隐藏
+     * 真正的显隐由 applyRibbonSettings 写入 Obsidian 原生状态
+     */
     private async hideRibbonItemByLabel(label: string) {
         if (!this.isRibbonManagerEnabled()) return;
 
-        // 查找对应的 Item ID
         const items = this.settings.RIBBON_SETTINGS;
         const targetItem = items.find(i => i.name === label); // name 通常就是 label
+        if (!targetItem) return;
 
-        let targetId = targetItem?.bpmUniqueId;
+        console.log(`[BPM] Drag-to-hide triggered for: ${label} (${targetItem.bpmUniqueId})`);
+        targetItem.visible = false;
 
-        // 如果 settings 里还没同步名字，尝试反查 app.workspace.leftRibbon
-        if (!targetId) {
-            const ribbonItems = (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items || [];
-            const nativeItem = ribbonItems.find((i): i is RibbonNativeItem => Boolean(i && (i.title === label || i.name === label)));
-            if (nativeItem?.buttonEl) targetId = (nativeItem.buttonEl as any).dataset.bpmUniqueId;
-        }
+        await this.saveSettings();
+        this.applyRibbonSettings();
 
-        if (targetId) {
-            console.log(`[BPM] Drag-to-hide triggered for: ${label} (${targetId})`);
+        // 如果 BPM 设置面板打开着，尝试刷新它
+        this.reloadIfCurrentModal();
 
-            // 执行隐藏逻辑
-            const targetConfig = this.settings.RIBBON_SETTINGS.find(i => i.bpmUniqueId === targetId);
-            if (targetConfig) {
-                targetConfig.visible = false;
-            } else {
-                // 如果是没管理的（理论上 init 时会同步），这里无法处理，返回
-                return;
-            }
-
-            // 保存设置 (这将更新 RIBBON_SETTINGS 到 data.json)
-            await this.saveSettings();
-
-            const orderedIds = this.settings.RIBBON_SETTINGS.map(i => i.bpmUniqueId);
-            const hiddenStatus: Record<string, boolean> = {};
-            this.settings.RIBBON_SETTINGS.forEach(i => hiddenStatus[i.bpmUniqueId] = !i.visible);
-
-            this.applyRibbonConfigToMemory(orderedIds, hiddenStatus);
-            // 更新 CSS 样式 (重要：这控制了实际的显隐)
-            this.updateRibbonStyles();
-
-            // 如果 BPM 设置面板打开着，尝试刷新它
-            this.reloadIfCurrentModal();
-
-            this.applyRibbonConfigToMemory(orderedIds, hiddenStatus);
-            this.updateRibbonStyles();
-
-            new Notice(this.translator.t("Ribbon_已隐藏_通知", { name: label }));
-        }
+        new Notice(this.translator.t("Ribbon_已隐藏_通知", { name: label }));
     }
 
     public isRibbonManagerEnabled(): boolean {
@@ -543,58 +629,6 @@ export default class Manager extends Plugin {
         if (!this.systemRibbonManager) this.systemRibbonManager = new SystemRibbonManager(this.app, this);
     }
 
-    /**
-     * 为内存中的 ribbon 项恢复/分配身份（幂等，不修改已保存配置）
-     * 启动、监听复位、Ribbon 面板三处共用，禁止各自重复实现
-     */
-    public assignRibbonRuntimeIds(): void {
-        this.ensureSystemRibbonManager();
-        this.systemRibbonManager?.assignMissingIds(this.settings.RIBBON_SETTINGS || []);
-    }
-
-    private clearRibbonStyleOverrides() {
-        activeDocument
-            .querySelectorAll<HTMLElement>('[data-bpm-ribbon-managed="true"], [data-bpm-menu-managed="true"]')
-            .forEach((element) => this.clearManagedElementStyle(element));
-    }
-
-    private rememberManagedElementStyle(element: HTMLElement, marker: "ribbon" | "menu") {
-        element.setAttribute(marker === "ribbon" ? "data-bpm-ribbon-managed" : "data-bpm-menu-managed", "true");
-        if (!element.hasAttribute("data-bpm-original-display")) {
-            element.setAttribute("data-bpm-original-display", element.style.display);
-        }
-        if (!element.hasAttribute("data-bpm-original-order")) {
-            element.setAttribute("data-bpm-original-order", element.style.order);
-        }
-    }
-
-    private clearManagedElementStyle(element: HTMLElement) {
-        const originalDisplay = element.getAttribute("data-bpm-original-display");
-        const originalOrder = element.getAttribute("data-bpm-original-order");
-
-        if (originalDisplay !== null) element.style.display = originalDisplay;
-        else element.style.removeProperty("display");
-
-        if (originalOrder !== null) element.style.order = originalOrder;
-        else element.style.removeProperty("order");
-
-        element.removeAttribute("data-bpm-ribbon-managed");
-        element.removeAttribute("data-bpm-menu-managed");
-        element.removeAttribute("data-bpm-original-display");
-        element.removeAttribute("data-bpm-original-order");
-    }
-
-    private applyManagedVisibility(element: HTMLElement, visible: boolean, marker: "ribbon" | "menu") {
-        this.rememberManagedElementStyle(element, marker);
-        const originalDisplay = element.getAttribute("data-bpm-original-display") || "";
-        element.style.display = visible ? originalDisplay : "none";
-    }
-
-    private applyManagedOrder(element: HTMLElement, order: number, marker: "ribbon" | "menu") {
-        this.rememberManagedElementStyle(element, marker);
-        element.style.order = `${order}`;
-    }
-
     private stopRibbonRuntimeFeatures() {
         if (this.dragObserverCleanup) {
             this.dragObserverCleanup();
@@ -603,63 +637,40 @@ export default class Manager extends Plugin {
         this.isRibbonDragging = false;
         this.draggedRibbonItem = null;
 
-        if (this.menuObserver) {
-            this.menuObserver.disconnect();
-            this.menuObserver = null;
+        this.removeRibbonItemHook();
+        if (this.ribbonItemApplyTimer !== null) {
+            window.clearTimeout(this.ribbonItemApplyTimer);
+            this.ribbonItemApplyTimer = null;
         }
-
-        // 停止 Ribbon DOM 监听器
-        if (this.ribbonDomObserver) {
-            this.ribbonDomObserver.disconnect();
-            this.ribbonDomObserver = null;
-        }
-        this.ribbonObserverRoot = null;
-
-        if (this.ribbonResyncDebouncer !== null) {
-            window.clearTimeout(this.ribbonResyncDebouncer);
-            this.ribbonResyncDebouncer = null;
-        }
-        this.ribbonResyncAttempts = 0;
-    }
-
-    private async syncStoredRibbonConfig() {
-        if (!this.isRibbonManagerEnabled()) return;
-
-        // 只为内存项恢复/分配 bpmUniqueId 并应用样式，不修改 RIBBON_SETTINGS
-        this.assignRibbonRuntimeIds();
-
-        this.updateRibbonStyles();
+        this.ribbonSettleTimers.forEach((handle) => window.clearTimeout(handle));
+        this.ribbonSettleTimers = [];
     }
 
     private startRibbonRuntimeFeatures() {
         if (!this.isRibbonManagerEnabled()) {
             this.stopRibbonRuntimeFeatures();
-            this.clearRibbonStyleOverrides();
             return;
         }
 
-        this.ensureSystemRibbonManager();
-        this.updateRibbonStyles();
-        if (Platform.isPhone) {
-            // 手机端使用菜单结构，需要监听菜单 DOM 变化
-            this.setupMenuObserver();
-        } else {
-            // 桌面端和平板端启用”拖出即隐藏”功能
-            this.setupDragToHideObserver();
-            // 桌面端和平板端启用 Ribbon DOM 监听器，应对其他插件干预
-            this.setupRibbonDomObserver();
-        }
+        this.applyRibbonSettings();
+        // 新条目一出生就复述设置：这是「插件开关后设置不生效」的结构性解法
+        this.installRibbonItemHook();
+        // 延时启动的插件分批到位，补几次兜底（固定次数，自动结束）
+        this.scheduleStartupSettleApplies();
+        // 手机端与桌面端的 ribbon 都源自同一份原生 items，显隐与顺序由原生状态承载，
+        // 不再需要按平台分别操作 DOM；仅「拖出即隐藏」这一手势在手机端不适用
+        if (!Platform.isPhone) this.setupDragToHideObserver();
     }
 
     public async refreshRibbonManagerFeature() {
         if (this.isRibbonManagerEnabled()) {
-            await this.syncStoredRibbonConfig();
             this.startRibbonRuntimeFeatures();
         } else {
             this.stopRibbonRuntimeFeatures();
-            this.systemRibbonManager?.stopWatch();
             this.systemRibbonManager = undefined;
-            this.clearRibbonStyleOverrides();
+            // 关闭接管 = 停止写入。原生状态无法与用户自己的改动区分，故不做回滚；
+            // 只剥掉旧机制可能残留在元素上的 inline 覆盖
+            this.clearLegacyRibbonOverrides();
             try {
                 this.ribbonModal?.close?.();
             } catch {
@@ -1087,10 +1098,11 @@ export default class Manager extends Plugin {
      * 清理 Obsidian Ribbon 内部 items 数组中的 undefined/null 项
      * 防止原生方法遍历时 crash
      * 同时清理重复的 ID，修复切换语言时核心插件图标重复的问题
+     * @returns 是否发生了清理（调用方据此决定是否让 Obsidian 重绘）
      */
-    public cleanRibbonItems() {
-        const ribbon = (this.app.workspace as WorkspaceWithRibbon).leftRibbon;
-        if (!ribbon || !ribbon.items || !Array.isArray(ribbon.items)) return;
+    public cleanRibbonItems(): boolean {
+        const ribbon = this.getLeftRibbon();
+        if (!ribbon || !ribbon.items || !Array.isArray(ribbon.items)) return false;
 
         let cleaned = false;
         const seenIds = new Set<string>();
@@ -1121,7 +1133,8 @@ export default class Manager extends Plugin {
             }
         }
 
-        if (cleaned) console.log("[BPM] Cleaned undefined/duplicate items from leftRibbon.");
+        if (cleaned && this.settings.DEBUG) console.log("[BPM] Cleaned undefined/duplicate items from leftRibbon.");
+        return cleaned;
     }
 
     // 关闭延时 调用
@@ -1177,9 +1190,22 @@ export default class Manager extends Plugin {
                 await this.saveSettings();
             }
         }
+
+        // 批量启停后可能出现新图标，登记一次（显隐与顺序由原生状态自行维持）
+        if (this.isRibbonManagerEnabled()) this.applyRibbonSettings();
     }
 
-    // 为所有插件关闭延迟
+    /**
+     * 关闭延时启动：把被延迟的插件交回 Obsidian 本体托管
+     * （disable 再 enableAndSave，使它们进入 community-plugins.json 并由 Obsidian 负责启动）
+     *
+     * 这是延时开关「关闭」时的专用交接路径，**只允许由设置里的延时开关调用**。
+     * 绝不可在 onunload 中调用：卸载分不清「退出 App / 重载插件 / 用户停用 BPM」，
+     * 会把用户配置改写掉并让延时启动失效（历史缺陷，详见 onunload 注释）。
+     *
+     * 与之对称的是 enableDelaysForAllPlugins（开关「开启」时把插件移出该文件并改用运行时延迟启动），
+     * 二者共同维持不变量：community-plugins.json 的内容 ↔ 延时开关状态。
+     */
     public async disableDelaysForAllPlugins() {
         const plugins = this.getDelayManagedPluginManifests();
         for (const pm of plugins) {
@@ -1191,6 +1217,8 @@ export default class Manager extends Plugin {
                 }
             }
         }
+
+        if (this.isRibbonManagerEnabled()) this.applyRibbonSettings();
     }
 
     // 延时启动指定插件
@@ -1201,7 +1229,15 @@ export default class Manager extends Plugin {
         if (plugin && plugin.enabled) {
             const delay = this.settings.DELAYS.find(item => item.id === plugin.delay);
             const time = delay ? delay.time : 0;
-            window.setTimeout(() => { void this.appPlugins.enablePlugin(id); }, time * 1000);
+            window.setTimeout(() => {
+                if (this.isUnloaded) return;
+                // 必须 await：插件的 onload 里才注册 ribbon 图标，
+                // 不等待就应用等于「条目还没出生就复述设置」，新条目会以 visible 状态留在侧边栏
+                void this.appPlugins.enablePlugin(id).then(() => {
+                    if (this.isUnloaded) return;
+                    if (this.isRibbonManagerEnabled()) this.applyRibbonSettings();
+                });
+            }, time * 1000);
         }
     }
 
@@ -1671,255 +1707,4 @@ export default class Manager extends Plugin {
         return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase()}`;
     }
 
-    public updateRibbonStyles() {
-        if (!this.settings) return;
-        if (!this.isRibbonManagerEnabled()) {
-            this.clearRibbonStyleOverrides();
-            return;
-        }
-
-        const items = this.settings.RIBBON_SETTINGS || [];
-        if (items.length === 0) {
-            this.clearRibbonStyleOverrides();
-            return;
-        }
-
-        // 只有手机端使用菜单结构，平板端使用桌面 Ribbon 结构
-        if (Platform.isPhone) {
-            activeDocument
-                .querySelectorAll<HTMLElement>(".menu-scroll")
-                .forEach((menuScroll) => this.processMenuItems(menuScroll));
-            return;
-        }
-
-        // 桌面端和平板端都使用这个逻辑
-        const ribbonElements = Array.from(
-            activeDocument.querySelectorAll<HTMLElement>(".side-dock-actions div.clickable-icon.side-dock-ribbon-action")
-        );
-
-        ribbonElements.forEach((element) => {
-            const item = this.findRibbonSettingForElement(element, items);
-            if (!item) {
-                if (element.hasAttribute("data-bpm-ribbon-managed")) this.clearManagedElementStyle(element);
-                return;
-            }
-
-            const order = Number.isFinite(item.order) ? item.order : 9999;
-            this.applyManagedOrder(element, order, "ribbon");
-            this.applyManagedVisibility(element, item.visible !== false, "ribbon");
-        });
-    }
-
-    private findRibbonSettingForElement(element: HTMLElement, items: RibbonItem[]): RibbonItem | undefined {
-        const label = element.getAttribute("aria-label") || element.getAttribute("title") || "";
-        if (!label) return undefined;
-
-        this.ensureSystemRibbonManager();
-        if (!this.systemRibbonManager) return undefined;
-
-        // 反查内存项拿到稳定身份（bpmUniqueId / 插件id+序号），再交由共用匹配实现解析
-        return this.systemRibbonManager.matchSetting(
-            this.systemRibbonManager.describeElement(element, label),
-            items
-        );
-    }
-
-    private menuObserver: MutationObserver | null = null;
-
-    setupMenuObserver() {
-        if (!this.isRibbonManagerEnabled() || this.menuObserver) return;
-
-        this.menuObserver = new MutationObserver((mutations) => {
-            if (!this.isRibbonManagerEnabled()) return;
-            let shouldProcess = false;
-            let targetNode: HTMLElement | null = null;
-
-            for (const mutation of mutations) {
-                if (mutation.addedNodes.length > 0) {
-                    for (const node of Array.from(mutation.addedNodes)) {
-                        if (node.nodeType === Node.ELEMENT_NODE) {
-                            const element = node as HTMLElement;
-                            if (element.classList?.contains("menu-scroll")) {
-                                targetNode = element;
-                                shouldProcess = true;
-                                break;
-                            } else {
-                                const menuScroll = element.querySelector(".menu-scroll");
-                                if (menuScroll) {
-                                    targetNode = menuScroll as HTMLElement;
-                                    shouldProcess = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (shouldProcess && targetNode) {
-                this.processMenuItems(targetNode);
-            }
-        });
-        this.menuObserver.observe(activeDocument.body, {
-            childList: true,
-            subtree: true,
-        });
-    }
-
-    processMenuItems(menuScrollElement: HTMLElement) {
-        if (!this.isRibbonManagerEnabled()) return;
-
-        // [修复] 移动端 Obsidian 菜单项包裹在 .menu-group 中
-        // 必须在 .menu-group 内排序，否则会破坏样式布局
-        let containerElement: HTMLElement = menuScrollElement;
-        const menuGroup = menuScrollElement.querySelector<HTMLElement>(".menu-group");
-        if (menuGroup) {
-            containerElement = menuGroup;
-        }
-
-        const menuItems = Array.from(containerElement.querySelectorAll<HTMLElement>(".menu-item"));
-        if (menuItems.length === 0) return;
-
-        const ribbonSettings = this.settings.RIBBON_SETTINGS || [];
-        const itemMap = new Map<HTMLElement, string>();
-
-        // 1. 预处理：设置 aria-label 并收集信息
-        menuItems.forEach((item) => {
-            // 已处理过的标记，防止重复处理相同逻辑（虽然 DOM 排序需要反复检查）
-            // 这里我们主要为了加 label
-            if (item.getAttribute("data-bpm-processed") !== "true") {
-                const titleEl = item.querySelector(".menu-item-title");
-                if (titleEl && titleEl.textContent) {
-                    const name = titleEl.textContent;
-                    if (!item.hasAttribute("aria-label")) item.setAttribute("aria-label", name);
-                    item.setAttribute("data-bpm-processed", "true");
-                }
-            }
-
-            // 无论是否处理过，都要获取名字用于排序
-            const name = item.getAttribute("aria-label");
-            if (name) itemMap.set(item, name);
-        });
-
-        // 2. 准备排序数据
-        // 匹配统一走 SystemRibbonManager.matchSetting，手机端与桌面端共用同一套优先级
-        this.ensureSystemRibbonManager();
-        const matcher = this.systemRibbonManager;
-
-        const itemsWithOrder = menuItems.map(item => {
-            const name = itemMap.get(item);
-            let order = 9999;
-            let visible = true;
-
-            if (name && matcher) {
-                const setting = matcher.matchSetting(
-                    matcher.describeTitle(name, item.dataset?.bpmUniqueId || null),
-                    ribbonSettings
-                );
-                if (setting) {
-                    order = setting.order;
-                    visible = setting.visible !== false;
-                }
-            }
-            return { item, order, visible };
-        });
-
-        // 3. 应用显隐 (直接操作 DOM 样式以确保移动端生效)
-
-        itemsWithOrder.forEach(({ item, visible }) => {
-            this.applyManagedVisibility(item, visible, "menu");
-        });
-
-        // 4. 检查是否需要排序
-        // 先按 order 排序生成目标列表
-        itemsWithOrder.sort((a, b) => a.order - b.order);
-
-        // 检查当前 DOM 顺序是否与目标一致
-        let needSort = false;
-        for (let i = 0; i < itemsWithOrder.length; i++) {
-            if (menuScrollElement.children[i] !== itemsWithOrder[i].item) {
-                needSort = true;
-                break;
-            }
-        }
-
-        // 5. 如果需要，执行重排
-        if (needSort) {
-            const fragment = activeDocument.createDocumentFragment();
-            itemsWithOrder.forEach(({ item }) => fragment.appendChild(item));
-            containerElement.appendChild(fragment);
-        }
-    }
-
-
-
-    // 功能编排只应用运行时样式，不写入 Obsidian workspace 配置或 Ribbon 内存状态。
-    applyRibbonConfigToMemory(orderedIds: string[], hiddenStatus: Record<string, boolean>) {
-        if (!this.isRibbonManagerEnabled()) {
-            this.clearRibbonStyleOverrides();
-            return;
-        }
-        this.updateRibbonStyles();
-    }
-
-    // ===== 以下方法当前无调用方，暂注释保留，待 main 主分支合并后 review 再决定去留 =====
-    //
-    // public async syncRibbonConfig(orderedIds: string[], hiddenStatus: Record<string, boolean>) {
-    //     if (!this.isRibbonManagerEnabled()) {
-    //         this.clearRibbonStyleOverrides();
-    //         return;
-    //     }
-    //
-    //     // 身份恢复统一走共用实现，禁止在此重复实现
-    //     this.assignRibbonRuntimeIds();
-    //     const saved = this.settings.RIBBON_SETTINGS || [];
-    //
-    //     // 依据内存项重建配置，已保存项的 visible / order 原样保留
-    //     this.settings.RIBBON_SETTINGS = this.collectRibbonSettings(saved);
-    //
-    //     await this.saveSettings();
-    //     this.updateRibbonStyles();
-    // }
-    //
-    // /**
-    //  * 依据当前内存中的 ribbon 项重建配置数组
-    //  * 内存中已不存在的项会被丢弃；新出现的项追加在末尾并默认显示
-    //  * @param saved 现有配置，用于继承用户的 visible / order
-    //  */
-    // private collectRibbonSettings(saved: RibbonItem[]): RibbonItem[] {
-    //     const memoryItems = (this.app.workspace as WorkspaceWithRibbon).leftRibbon?.items || [];
-    //     const savedById = new Map<string, RibbonItem>();
-    //     saved.filter(Boolean).forEach((item) => savedById.set(item.bpmUniqueId, item));
-    //
-    //     const rebuilt: RibbonItem[] = [];
-    //     const processed = new Set<string>();
-    //
-    //     // 1. 仍存在于内存中的项：沿用共用构造方法继承用户设置
-    //     memoryItems.forEach((item) => {
-    //         const uniqueId = item?.buttonEl?.dataset?.bpmUniqueId;
-    //         if (!uniqueId || processed.has(uniqueId)) return;
-    //         if (!savedById.has(uniqueId) || !item?.title) return;
-    //
-    //         processed.add(uniqueId);
-    //         rebuilt.push(this.buildRibbonSetting(item, rebuilt.length, savedById.get(uniqueId)));
-    //     });
-    //
-    //     // 2. 内存中新出现的项：追加在末尾并默认显示
-    //     memoryItems.forEach((item) => {
-    //         const uniqueId = item?.buttonEl?.dataset?.bpmUniqueId;
-    //         if (!uniqueId || processed.has(uniqueId)) return;
-    //         if (!item?.title || !item?.id) return;
-    //
-    //         processed.add(uniqueId);
-    //         rebuilt.push(this.buildRibbonSetting(item, rebuilt.length));
-    //     });
-    //
-    //     // 3. 按 order 排序并重新分配连续的 order
-    //     rebuilt.sort((a, b) => a.order - b.order);
-    //     rebuilt.forEach((item, index) => {
-    //         item.order = index;
-    //     });
-    //
-    //     return rebuilt;
-    // }
 }

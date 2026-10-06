@@ -158,7 +158,7 @@ export default {
     设置_基础设置_隐藏BPM标签_标题: '隐藏 BPM 预设标签（安装/忽略）',
     设置_基础设置_隐藏BPM标签_描述: '开启后列表不显示自动添加的 BPM 安装和 BPM 忽略标签。',
     设置_基础设置_边栏编排_标题: '启用边栏编排',
-    设置_基础设置_边栏编排_描述: '开启后 BPM 接管 Ribbon 图标的排序和显隐；关闭后移除接管，使用 Obsidian 原生边栏顺序。',
+    设置_基础设置_边栏编排_描述: '开启后 BPM 接管 Ribbon 图标的排序和显隐（写入 Obsidian 原生边栏状态，插件开关后依然生效）；关闭后 BPM 停止接管，边栏保持当前状态，可自行调整。',
     设置_基础设置_启动检查更新_标题: '启动时检测插件更新',
     设置_基础设置_启动检查更新_描述: '打开 BPM 时自动检测可更新插件，并在右上角提示数量。',
     设置_基础设置_来源启动检查更新_标题: '启动时检测来源更新',
@@ -332,7 +332,7 @@ export default {
     设置_基础设置_标签样式_选项_四: '样式四',
 
     设置_基础设置_延时启动_标题: '延时启动',
-    设置_基础设置_延时启动_描述: '启用延时启动功能可以优化加载顺序，但请注意，这可能会导致某些插件出现兼容性问题。',
+    设置_基础设置_延时启动_描述: '启用延时启动功能可以优化加载顺序，但请注意，这可能会导致某些插件出现兼容性问题。开启期间，被接管的插件由 BPM 启动、不写入 Obsidian 插件列表；若要先停用或卸载 BPM，请先关闭本开关，让插件交回 Obsidian 托管，否则它们下次启动不会自动加载。',
     设置_基础设置_淡化插件_标题: '淡化插件',
     设置_基础设置_淡化插件_描述: '为未启用的插件提供视觉淡化效果，以便清晰地区分启用和未启用的插件。',
 
@@ -428,6 +428,9 @@ export default {
     command_notice_plugin_disabled: '已禁用 {name}',
     command_notice_enable_before_settings: '请先启用此插件再打开设置',
     command_notice_failed: '命令执行失败，请查看控制台。',
+    command_apply_ribbon_settings: '立即应用 Ribbon 设置',
+    command_notice_ribbon_settings_applied: '已应用 Ribbon 设置（{count} 个图标）',
+    Ribbon_原生接口不可用: 'Ribbon 设置未应用：当前 Obsidian 版本未暴露原生侧边栏接口。',
     command_snapshot_plugin: '插件命令：{name}',
     command_snapshot_group: '分组命令：{name}',
     command_snapshot_tag: '标签命令：{name}',
@@ -806,7 +809,7 @@ export default {
     // Ribbon 补充
     Ribbon_已隐藏_通知: '已隐藏 Ribbon 图标：{name}',
     Ribbon_功能编排_标题: '边栏编排',
-    Ribbon_功能编排_说明: '调整 Ribbon 图标顺序和显隐状态；只保存到 BPM 数据，不写入 Obsidian 工作区配置。',
+    Ribbon_功能编排_说明: '调整 Ribbon 图标顺序和显隐；顺序与显隐以本面板为准，直接拖动侧边栏图标会被覆盖。',
     Ribbon_重置_提示: '显示全部并按名称排序',
     Ribbon_重置_确认: '重置功能编排？这会显示全部 Ribbon 项，并按名称排序。',
 

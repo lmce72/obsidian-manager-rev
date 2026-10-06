@@ -1325,6 +1325,7 @@ export const applyManagerTransferPackage = async (
 	}
 
 	await manager.saveSettings();
-	manager.updateRibbonStyles();
+	// 导入过程会批量启停插件，收尾统一走唯一应用入口（登记新图标 + 写入原生状态）
+	manager.applyRibbonSettings();
 	return result;
 };

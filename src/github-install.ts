@@ -502,6 +502,9 @@ export const installPluginFromGithub = async (
 		}
 		await manager.appPlugins.enablePluginAndSave(manifest.id);
 
+		// 刚安装/重载的插件可能带来新 ribbon 图标，登记一次
+		manager.applyRibbonSettings();
+
 		if (markAsBpm && !manager.settings.BPM_INSTALLED.includes(manifest.id)) {
 			manager.settings.BPM_INSTALLED.push(manifest.id);
 		}

@@ -41,15 +41,12 @@ export class RibbonModal extends Modal {
         this.display();
     }
 
-    // 同步 Ribbon 项：只确保 bpmUniqueId 已分配，不修改已保存的配置
+    // 同步 Ribbon 项：登记尚未见过的新图标并把配置应用到原生状态
+    // 面板打开时调用一次，保证列表列全（显隐与顺序由 Obsidian 原生状态承载）
     async syncRibbonItems() {
         if (!this.manager.isRibbonManagerEnabled()) return;
 
-        // 身份恢复统一由 Manager 提供（与启动、监听复位共用同一实现）
-        this.manager.assignRibbonRuntimeIds();
-
-        // 确保样式已应用（使用已保存的配置）
-        this.manager.updateRibbonStyles();
+        this.manager.applyRibbonSettings();
     }
 
     private getRibbonFallbackIcon(item: RibbonItem): string {
@@ -422,12 +419,8 @@ export class RibbonModal extends Modal {
 
                 await this.manager.saveSettings();
 
-                // 只应用配置到内存，不要调用 syncRibbonConfig（避免覆盖刚保存的配置）
-                const orderedIds = allItems.map(i => i.bpmUniqueId);
-                const hiddenStatus: Record<string, boolean> = {};
-                allItems.forEach(i => hiddenStatus[i.bpmUniqueId] = !i.visible);
-                this.manager.applyRibbonConfigToMemory(orderedIds, hiddenStatus);
-                this.manager.updateRibbonStyles();
+                // 顺序已写入设置，推入 Obsidian 原生状态
+                this.manager.applyRibbonSettings();
             }
         }
 
@@ -462,13 +455,8 @@ export class RibbonModal extends Modal {
         items.forEach((item, idx) => item.order = idx);
         await this.manager.saveSettings();
 
-        const orderedIds = items.map(i => i.bpmUniqueId);
-        const hiddenStatus: Record<string, boolean> = {};
-        items.forEach(i => hiddenStatus[i.bpmUniqueId] = !i.visible);
-        this.manager.applyRibbonConfigToMemory(orderedIds, hiddenStatus);
-
-        // @ts-ignore
-        this.manager.updateRibbonStyles?.();
+        // 显隐与顺序推入 Obsidian 原生状态
+        this.manager.applyRibbonSettings();
     }
 
     async resetRibbonLayout() {

@@ -136,6 +136,9 @@ export default class Agreement {
             // 禁用插件
             await pluginRegistry.disablePlugin(id);
         }
+
+        // 新装的插件可能带来新 ribbon 图标，登记一次
+        this.plugin.applyRibbonSettings();
     }
 
     /**

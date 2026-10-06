@@ -8494,12 +8494,10 @@ body.theme-dark {
     outline: none;
 }
 
-/* Ribbon ¾nePíI token
-   Lbï ribbon b/ .manager-container …„ .manager-ribbon-pageïô¥çíI token
-   FK:ïåìË!F .modal.ribbon-manager-modal S öVHş
-¡	ûUğ --bpm-* „
-   ¹hüôşæG:ø/•r÷½¶öÊIV --bpm-* „7ta1H
-    .manager-container / .manager-version-picker I¹hİ W+ */
+/* è¯´æ˜ï¼šè¾¹æ ç¼–æ’å¼¹çª—è‡ªå¸¦ä¸€ä»½ --bpm-* å˜é‡ï¼Œè€Œä¸æ˜¯ç›´æ¥ç»§æ‰¿ .manager-container / .manager-version-picker
+   åŸå› ï¼šåä¸¤è€…å·²ç»å£°æ˜è¿‡åŒå --bpm-*ï¼Œç›´æ¥ç»§æ‰¿ä¼šäº’ç›¸è¦†ç›–
+   Note: the ribbon modal declares its own --bpm-* tokens instead of inheriting them from
+   .manager-container / .manager-version-picker, which already define the same names. */
 .ribbon-manager-modal {
     --bpm-radius: var(--bpm-ui-radius);
     --bpm-radius-sm: var(--bpm-ui-radius-sm);
@@ -8535,11 +8533,10 @@ body.theme-dark {
     padding: 0;
 }
 
-/* LC ,«1/ Obsidian „ .setting-item!F…„
-   .modal:not(.mod-settings) .setting-item:not(.setting-item-heading):where(...) Äå (0,4,0)
-   ğ† background-color: transparent / padding / border-radius: 0àdåLÄ
-   Å{¾0 (0,5,0) MıH:not(.drag-ghost) såĞCMÖı}uo,( body 
-   (,¹h…Eå&šR:	÷ÿS\—Y d */
+/* è¯´æ˜ï¼šObsidian åŸç”Ÿ .modal:not(.mod-settings) .setting-item:not(.setting-item-heading):where(...)
+   ä»¥ (0,4,0) çš„ä¼˜å…ˆçº§å¼ºåˆ¶ background-color: transparent / padding / border-radius: 0ï¼›
+   è¿™é‡Œå¿…é¡»ç”¨ (0,5,0) çš„é€‰æ‹©å™¨é“¾ :not(.drag-ghost) æ‰èƒ½å‹è¿‡å®ƒï¼Œä¸”ä¸å— body ä¸Šçš„æ ·å¼å½±å“
+   Note: Obsidian's native rule above wins at (0,4,0); this chain needs (0,5,0) to override it. */
 .ribbon-manager-modal .draggable-list-container .setting-item.draggable-item:not(.drag-ghost) {
     position: relative;
     display: flex;
@@ -8626,7 +8623,7 @@ body.theme-dark {
     stroke-width: 2.2;
 }
 
-/* Ï„şæGtWl:-'p>:„ accent E•bùÔ */
+/* å·²éšè—é¡¹ï¼šå›¾æ ‡æ”¹ç”¨å¼±åŒ–é…è‰²è€Œé accent / Hidden item: muted icon palette instead of accent */
 .ribbon-manager-modal .draggable-item.is-hidden .setting-item-icon {
     border-color: color-mix(in srgb, var(--text-muted) 34%, var(--bpm-border));
     background: var(--bpm-muted);

@@ -1,51 +1,47 @@
-import { App, EventRef, Platform, TFile, debounce } from "obsidian";
+import { App } from "obsidian";
 import Manager from "../main";
 import { RibbonItem } from "../data/types";
 import { RibbonNativeItem, WorkspaceWithRibbon } from "../obsidian-internals";
 
-export interface RibbonConfig {
-    hiddenItems: { [id: string]: boolean };
+/**
+ * 一个内存 ribbon 项的解析结果：设置层与 Obsidian 内存项之间的唯一桥接
+ * Resolution of one in-memory ribbon item: the single bridge between settings and native items.
+ */
+export interface RibbonResolution {
+    item: RibbonNativeItem;
+    /** 同一插件内的出现序号（从 1 开始） */
+    sequence: number;
+    /** 命中的已保存条目；为空说明这是 BPM 尚未登记的新图标 */
+    setting?: RibbonItem;
+    /** 命中的条目其 name / ribbonIdMap 与当前内存项不一致，需要回写标识字段 */
+    identityDrifted: boolean;
+    /** 是否通过「孤儿认领」命中（仅供排查） */
+    adopted: boolean;
+}
+
+/** 解析过程中的单项上下文 */
+interface ItemContext {
+    item: RibbonNativeItem;
+    pluginId: string;
+    sequence: number;
 }
 
 /**
- * 身份匹配的候选信息，桌面/平板（内存项）与手机（菜单项）共用
- * Match descriptor shared by desktop/tablet (memory item) and phone (menu item).
+ * Ribbon 身份匹配的唯一实现
+ * 纯内存计算：输入 Obsidian 的 leftRibbon.items 与 BPM 的 RIBBON_SETTINGS，
+ * 不读写任何 DOM 属性（显隐与顺序由 Obsidian 原生状态承载）
+ *
+ * The single implementation of ribbon identity matching.
+ * Pure in-memory: takes leftRibbon.items plus RIBBON_SETTINGS and never touches DOM attributes
+ * (visibility and order live in Obsidian's native state).
  */
-export interface RibbonMatchTarget {
-    /** 元素上已有的 bpmUniqueId；为空说明这个图标尚未被托管 */
-    bpmUniqueId?: string | null;
-    /** Obsidian 内存项 id，形如 "nutstore-sync:开始同步"（随语言/标题变化） */
-    ribbonItemId?: string | null;
-    /** 显示名称（aria-label / 菜单标题） */
-    title?: string | null;
-    /** 同一插件内的出现序号（从 1 开始；无法计算时传 null） */
-    sequence?: number | null;
-}
-
 export class SystemRibbonManager {
     private app: App;
     private manager: Manager;
-    private configPath: string;
-    // 以下两个字段仅供已注释的 startWatch 使用，随其一同注释保留
-    // private isInternalUpdate = false;
-    // private onConfigChange: () => void = () => undefined;
-    // fileWatcher 仍被 stopWatch 使用，保留
-    private fileWatcher: EventRef | null = null;
 
     constructor(app: App, manager: Manager) {
         this.app = app;
         this.manager = manager;
-        // 自动判定配置文件路径
-        this.configPath = Platform.isMobile
-            ? `${this.app.vault.configDir}/workspace-mobile.json`
-            : `${this.app.vault.configDir}/workspace.json`; // 默认路径，可能会根据 configDir 变化
-
-        // 更严谨的路径获取
-        if (this.app.vault.configDir) {
-            this.configPath = Platform.isMobile
-                ? `${this.app.vault.configDir}/workspace-mobile.json`
-                : `${this.app.vault.configDir}/workspace.json`;
-        }
     }
 
     // ==================== 身份解析与匹配（唯一实现，禁止在调用方重复） ====================
@@ -70,6 +66,16 @@ export class SystemRibbonManager {
     }
 
     /**
+     * 由 bpmUniqueId 反推插件前缀（格式为「插件id」或「插件id#序号」）
+     * 用于判断孤儿条目是否属于同一个插件
+     */
+    public static pluginPrefixOf(uid?: string | null): string {
+        if (!uid) return "";
+        const hash = uid.indexOf("#");
+        return hash === -1 ? uid : uid.slice(0, hash);
+    }
+
+    /**
      * 读取内存中的 ribbon 项（过滤 null/undefined，Obsidian 内部数组可能含空洞）
      */
     private getMemoryItems(): RibbonNativeItem[] {
@@ -78,19 +84,8 @@ export class SystemRibbonManager {
     }
 
     /**
-     * 统计某个内存项在其插件的 ribbon 项中的序号（从 1 开始）
-     * 未命中返回 0；序号是「插件id+序号」匹配的关键，必须与历史分配规则一致
-     */
-    private sequenceOf(items: RibbonNativeItem[], target: RibbonNativeItem): number {
-        const pluginId = SystemRibbonManager.pluginIdOf(target.id);
-        if (!pluginId) return 0;
-        const siblings = items.filter((item) => SystemRibbonManager.pluginIdOf(item.id) === pluginId);
-        return siblings.indexOf(target) + 1;
-    }
-
-    /**
-     * 建立已保存配置的多路索引，供身份恢复与元素匹配复用
-     * 索引键：uid(精确身份) / seq(插件id+序号) / rid(ribbonIdMap 记录的内存项 id) / name(名称)
+     * 建立已保存条目的多路索引，供身份匹配复用
+     * 索引键：rid(ribbonIdMap 记录的内存项 id) / seq(插件id+序号) / name(名称)
      */
     private buildSavedIndex(saved: RibbonItem[]): Map<string, RibbonItem> {
         const index = new Map<string, RibbonItem>();
@@ -98,7 +93,6 @@ export class SystemRibbonManager {
             if (!item) return;
 
             if (item.bpmUniqueId) {
-                index.set(`uid:${item.bpmUniqueId}`, item);
                 // bpmUniqueId 本身即「插件id」或「插件id#序号」，可直接作为序号键使用
                 index.set(`seq:${item.bpmUniqueId}`, item);
             }
@@ -115,6 +109,24 @@ export class SystemRibbonManager {
     }
 
     /**
+     * 建立「插件id|图标名」索引，供图标策略判断唯一性
+     * 图标名是插件源码里的常量，比会被本地化的标题稳定得多
+     */
+    private buildIconIndex(saved: RibbonItem[]): Map<string, RibbonItem[]> {
+        const index = new Map<string, RibbonItem[]>();
+        (saved || []).forEach((item) => {
+            if (!item || !item.icon) return;
+            const pluginId = SystemRibbonManager.pluginPrefixOf(item.bpmUniqueId);
+            if (!pluginId) return;
+            const key = `${pluginId}|${item.icon}`;
+            const list = index.get(key);
+            if (list) list.push(item);
+            else index.set(key, [item]);
+        });
+        return index;
+    }
+
+    /**
      * 名称匹配：单行要求完全相等；多行要求每一行都被包含（沿用既有约定）
      */
     private titleMatchesName(label: string, itemName: string): boolean {
@@ -124,186 +136,148 @@ export class SystemRibbonManager {
     }
 
     /**
-     * 为内存中的 ribbon 项补齐 bpmUniqueId（幂等）
-     * 插件重载/更新会重建 buttonEl 并丢失 dataset，身份必须由本方法重建，否则只能靠名称硬猜
-     * 匹配优先级：ribbonIdMap(跨语言) → 插件id+序号 → 名称 → 新生成
-     * @returns 是否存在新分配的身份
+     * 解析全部内存项与已保存条目的对应关系（设置层唯一入口）
+     *
+     * 匹配优先级：ribbonIdMap → 插件id+图标名 → 插件id+序号 → 名称 → 孤儿认领
+     * 全部未命中时 setting 为空，由调用方决定是否登记为新条目
+     *
+     * @param saved 已保存的 Ribbon 配置
+     * @param items 内存 ribbon 项（顺序即序号依据，省略时取 leftRibbon.items）
      */
-    public assignMissingIds(saved: RibbonItem[]): boolean {
-        const index = this.buildSavedIndex(saved);
-        const items = this.getMemoryItems();
+    public resolve(saved: RibbonItem[], items?: RibbonNativeItem[]): RibbonResolution[] {
+        const list = (saved || []).filter((entry): entry is RibbonItem => Boolean(entry));
+        const memoryItems = items || this.getMemoryItems();
+        const index = this.buildSavedIndex(list);
+        const iconIndex = this.buildIconIndex(list);
+
+        // 1. 先算好每个内存项的插件前缀与序号：序号必须在同一插件内按 items 顺序累加，
+        //    「插件id+序号」才与历史分配规则一致
         const counters = new Map<string, number>();
-        let changed = false;
-
-        items.forEach((item) => {
-            const buttonEl = item.buttonEl as HTMLElement | undefined;
-            if (!buttonEl) return;
-
+        const contexts: ItemContext[] = memoryItems.map((item) => {
             const pluginId = SystemRibbonManager.pluginIdOf(item.id);
-            // 序号必须在跳过判断之前累加，否则已有身份的项会打乱后续序号
             const sequence = (counters.get(pluginId) || 0) + 1;
             counters.set(pluginId, sequence);
-
-            if (buttonEl.dataset?.bpmUniqueId) return;
-
-            const matched =
-                (item.id ? index.get(`rid:${item.id}`) : undefined) ||
-                (pluginId ? index.get(`seq:${SystemRibbonManager.candidateId(pluginId, sequence)}`) : undefined) ||
-                (item.title ? index.get(`name:${item.title}`) : undefined);
-
-            const assigned = matched?.bpmUniqueId || SystemRibbonManager.candidateId(pluginId, sequence);
-            if (!assigned) return;
-
-            buttonEl.dataset.bpmUniqueId = assigned;
-            changed = true;
+            return { item, pluginId, sequence };
         });
 
-        return changed;
+        // 2. 常规匹配，同时收集「已被某个内存项命中」的条目
+        const liveUids = new Set<string>();
+        const matches = contexts.map((ctx) => {
+            const hit = this.matchItem(ctx, list, index, iconIndex);
+            if (hit) liveUids.add(hit.bpmUniqueId);
+            return hit;
+        });
+
+        // 3. 孤儿 = 已保存、但没有任何内存项命中它的条目
+        //    最可能的归属是「换了标题或换了内存项 id 的同一个图标」
+        const orphans = list.filter((entry) => !liveUids.has(entry.bpmUniqueId));
+        const claimed = new Set<string>();
+
+        return contexts.map((ctx, position) => {
+            let setting = matches[position];
+            let adopted = false;
+
+            if (!setting && orphans.length > 0) {
+                setting = this.findAdoptableOrphan(ctx, orphans, claimed);
+                adopted = Boolean(setting);
+                if (setting) claimed.add(setting.bpmUniqueId);
+            }
+
+            const identityDrifted = Boolean(setting) && !this.identityMatches(setting as RibbonItem, ctx.item);
+            const resolution: RibbonResolution = {
+                item: ctx.item,
+                sequence: ctx.sequence,
+                setting,
+                identityDrifted,
+                adopted
+            };
+
+            if (this.manager.settings?.DEBUG) {
+                if (adopted) {
+                    console.log("[BPM] Ribbon orphan adopted", ctx.item.id, "→", setting?.bpmUniqueId);
+                } else if (!setting) {
+                    console.log("[BPM] Ribbon item unmatched (will be registered)", ctx.item.id, "icon:", ctx.item.icon);
+                }
+            }
+
+            return resolution;
+        });
     }
 
     /**
-     * 解析目标对应的已保存配置项（桌面/平板/手机共用的唯一匹配实现）
-     * 匹配优先级：bpmUniqueId → 插件id+序号 → ribbonIdMap → 名称
+     * 单个内存项的常规匹配（不含孤儿认领）
+     * @param candidates 参与本次匹配的条目集合，默认全部已保存条目
      */
-    public matchSetting(target: RibbonMatchTarget, saved: RibbonItem[]): RibbonItem | undefined {
-        const index = this.buildSavedIndex(saved);
+    private matchItem(
+        ctx: ItemContext,
+        candidates: RibbonItem[],
+        index: Map<string, RibbonItem>,
+        iconIndex: Map<string, RibbonItem[]>
+    ): RibbonItem | undefined {
+        const { item, pluginId, sequence } = ctx;
+        const pick = (hit?: RibbonItem) => (hit && candidates.indexOf(hit) !== -1 ? hit : undefined);
 
-        // 1. 已带身份：精确命中
-        if (target.bpmUniqueId) {
-            const hit = index.get(`uid:${target.bpmUniqueId}`);
+        // 1. ribbonIdMap：记录过各语言下的内存项 id，跨语言仍可命中，最可靠
+        if (item.id) {
+            const hit = pick(index.get(`rid:${item.id}`));
             if (hit) return hit;
         }
 
-        // 2. 插件 id + 序号：与语言、标题都无关，最稳定
-        const pluginId = SystemRibbonManager.pluginIdOf(target.ribbonItemId);
-        if (pluginId && target.sequence) {
-            const hit = index.get(`seq:${SystemRibbonManager.candidateId(pluginId, target.sequence)}`);
-            if (hit) return hit;
+        // 2. 插件id + 图标名：图标名是插件源码常量，比标题稳定
+        //    该「插件+图标」组合必须唯一，避免同插件多图标共用同一图标名时误判
+        if (pluginId && item.icon) {
+            const sameIcon = (iconIndex.get(`${pluginId}|${item.icon}`) || []).filter(
+                (entry) => candidates.indexOf(entry) !== -1
+            );
+            if (sameIcon.length === 1) return sameIcon[0];
         }
 
-        // 3. ribbonIdMap：记录了各语言下的内存项 id，切换语言后仍可命中
-        if (target.ribbonItemId) {
-            const hit = index.get(`rid:${target.ribbonItemId}`);
+        // 3. 插件id + 序号：与语言、标题都无关
+        if (pluginId && sequence) {
+            const hit = pick(index.get(`seq:${SystemRibbonManager.candidateId(pluginId, sequence)}`));
             if (hit) return hit;
         }
 
         // 4. 名称兜底
-        if (target.title) {
-            const hit = index.get(`name:${target.title}`);
+        if (item.title) {
+            const hit = pick(index.get(`name:${item.title}`));
             if (hit) return hit;
-            return (saved || []).find((item) => item.name && this.titleMatchesName(target.title as string, item.name));
+            return candidates.find((entry) => entry.name && this.titleMatchesName(item.title as string, entry.name));
         }
 
         return undefined;
     }
 
     /**
-     * 由 DOM 元素反查内存项并生成匹配描述（桌面端/平板端）
-     * 反查用 buttonEl 全等比较，拿到的 id/序号是稳定身份
+     * 孤儿认领：为「内存中已无归属」的旧条目找回它的图标
+     *
+     * 保守规则（任一不满足即放弃，退回新铸身份）：
+     * - 孤儿必须与当前项属于同一插件前缀
+     * - 孤儿的 ribbonIdMap 记录过当前内存项 id，或孤儿 name 与当前标题完全相等
+     * - 候选必须唯一（有歧义说明无法确定归属）
      */
-    public describeElement(element: HTMLElement, label: string): RibbonMatchTarget {
-        const items = this.getMemoryItems();
-        const memoryItem = items.find((item) => item.buttonEl === element);
+    private findAdoptableOrphan(ctx: ItemContext, orphans: RibbonItem[], claimed: Set<string>): RibbonItem | undefined {
+        if (!ctx.pluginId) return undefined;
 
-        return {
-            bpmUniqueId: memoryItem?.buttonEl?.dataset?.bpmUniqueId ?? null,
-            ribbonItemId: memoryItem?.id ?? null,
-            title: label || null,
-            sequence: memoryItem ? this.sequenceOf(items, memoryItem) : null
-        };
+        const hits = orphans.filter((entry) => {
+            if (claimed.has(entry.bpmUniqueId)) return false;
+            if (SystemRibbonManager.pluginPrefixOf(entry.bpmUniqueId) !== ctx.pluginId) return false;
+
+            const sameId = Boolean(ctx.item.id) && Object.values(entry.ribbonIdMap || {}).includes(ctx.item.id as string);
+            const sameName = Boolean(ctx.item.title) && entry.name === ctx.item.title;
+            return sameId || sameName;
+        });
+
+        return hits.length === 1 ? hits[0] : undefined;
     }
 
     /**
-     * 由标题生成匹配描述（手机端菜单项没有 id/dataset，用标题反查内存项补齐身份）
-     * @param ownUniqueId 菜单元素自身已带的身份（若有则优先）
+     * 条目的标识字段是否与当前内存项一致
+     * 只关心「能否再次匹配上」：任一语言键下记录过当前 id，且名称相同
      */
-    public describeTitle(title: string, ownUniqueId?: string | null): RibbonMatchTarget {
-        const items = this.getMemoryItems();
-        const memoryItem = items.find((item) => item.title === title);
-
-        return {
-            bpmUniqueId: ownUniqueId || memoryItem?.buttonEl?.dataset?.bpmUniqueId || null,
-            ribbonItemId: memoryItem?.id ?? null,
-            title: title || null,
-            sequence: memoryItem ? this.sequenceOf(items, memoryItem) : null
-        };
-    }
-
-    /**
-     * 读取配置
-     * @returns 返回有序的 ID 列表和显隐状态 Map
-     */
-    public async load(): Promise<{ orderedIds: string[], hiddenStatus: Record<string, boolean> }> {
-        try {
-            const exists = await this.app.vault.adapter.exists(this.configPath);
-            if (!exists) {
-                console.warn(`[BPM] Workspace config not found at ${this.configPath}`);
-                return { orderedIds: [], hiddenStatus: {} };
-            }
-
-            const content = await this.app.vault.adapter.read(this.configPath);
-            const json = JSON.parse(content);
-            const leftRibbon = json["left-ribbon"];
-
-            if (!leftRibbon || !leftRibbon.hiddenItems) {
-                return { orderedIds: [], hiddenStatus: {} };
-            }
-
-            // 在 JS 引擎中，和 JSON 标准中，Object.keys 的顺序对于非整数键通常是插入顺序。
-            // Obsidian 利用这一特性来存储顺序。
-            const hiddenItems = leftRibbon.hiddenItems;
-            const orderedIds = Object.keys(hiddenItems);
-            const hiddenStatus = hiddenItems;
-
-            return { orderedIds, hiddenStatus };
-        } catch (e) {
-            console.error("[BPM] Failed to load workspace config", e);
-            return { orderedIds: [], hiddenStatus: {} };
-        }
-    }
-
-    // ===== 以下两个方法当前无调用方，暂注释保留，待 main 主分支合并后 review 再决定去留 =====
-    // 说明：ribbon 布局已只存于 BPM 数据中，不再读写 workspace 配置，故 save / startWatch 失去用途。
-    // 恢复时无需改动导入：debounce 与 TFile 仅为 startWatch 保留。
-    //
-    // /**
-    //  * 保存配置
-    //  * @param orderedIds 按期望顺序排列的 ID 列表
-    //  * @param hiddenStatus 每个 ID 的显隐状态
-    //  */
-    // public async save(orderedIds: string[], hiddenStatus: Record<string, boolean>) {
-    //     // 保留方法签名兼容旧调用，但不写入 Obsidian workspace 配置文件。
-    //     if (this.manager.settings.DEBUG) {
-    //         console.log("[BPM] Workspace config save skipped; ribbon layout is stored only in BPM data.", orderedIds, hiddenStatus);
-    //     }
-    // }
-    //
-    // /**
-    //  * 启动文件监听
-    //  * @param callback 配置变更时的回调
-    //  */
-    // public startWatch(callback: () => void) {
-    //     this.onConfigChange = callback;
-    //     // 使用 debounce 防止频繁触发
-    //     const debouncedReload = debounce(() => {
-    //         if (this.isInternalUpdate) return;
-    //         console.log("[BPM] Detected workspace config change, reloading...");
-    //         this.onConfigChange();
-    //     }, 1000, true);
-    //
-    //     // 监听 vault 修改事件
-    //     this.fileWatcher = this.app.vault.on("modify", (file) => {
-    //         if (file instanceof TFile && file.path === this.configPath) {
-    //             debouncedReload();
-    //         }
-    //     });
-    // }
-
-    // 仍被 onunload 与 refreshRibbonManagerFeature 调用，保留
-    public stopWatch() {
-        if (this.fileWatcher) {
-            this.app.vault.offref(this.fileWatcher);
-            this.fileWatcher = null;
-        }
+    private identityMatches(entry: RibbonItem, item: RibbonNativeItem): boolean {
+        const idRecorded = Boolean(item.id) && Object.values(entry.ribbonIdMap || {}).includes(item.id as string);
+        const nameRecorded = Boolean(item.title) && entry.name === item.title;
+        return idRecorded && nameRecorded;
     }
 }

@@ -122,6 +122,8 @@ export class TroubleshootAlgorithm {
         }
 
         await this.manager.saveSettings();
+        // 全量启停后可能出现新 ribbon 图标，登记一次
+        this.manager.applyRibbonSettings();
     }
 
     /**
